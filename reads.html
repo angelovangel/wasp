@@ -3,7 +3,7 @@
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Mapped reads</title>
+    <title>Mapped reads · wasp</title>
     <style>
         :root {
             --bg: #f8f9fa;
@@ -248,7 +248,7 @@
     const sampleName = hashParams.get('sample') || '';
     if (contigName) {
         $('title').textContent = contigName;
-        document.title = `${sampleName ? sampleName + ' · ' : ''}${contigName} · reads`;
+        document.title = `${sampleName ? sampleName + ' · ' : ''}${contigName} · wasp`;
     }
 
     function fmtBp(bp) {
@@ -838,7 +838,7 @@
         const c = data.contig, ref = data.ref;
         const out = [
             '##fileformat=VCFv4.2',
-            '##source=wasm-minimap2 reads view (allele counts from the loaded reads, not a variant caller)',
+            '##source=wasp reads view (allele counts from the loaded reads, not a variant caller)',
             `##contig=<ID=${c.name},length=${c.length}>`,
             '##INFO=<ID=DP,Number=1,Type=Integer,Description="Reads with a base or deletion at the position">',
             '##INFO=<ID=AC,Number=A,Type=Integer,Description="Reads supporting ALT">',
