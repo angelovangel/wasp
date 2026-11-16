@@ -2,11 +2,6 @@ const CLI = await new Aioli([
     "samtools/1.10", 
     "minimap2/2.22",
     "seqtk/1.4"
-    // {
-    //     tool: "faster2",
-    //     version: "0.3.0",
-    //     urlPrefix: "http://localhost:8000/faster2"
-    // }
 ], {debug: true});
 
 const NBINS = 300; // number of windows in each contig's depth profile
@@ -484,6 +479,7 @@ function samplePanelHtml(sm, si, readsLabel, visible) {
             <div class="sample-downloads">
                 <a class="btn btn-success me-2" href="${sm.bamUrl}" download="${safe}.sorted.bam">Download BAM</a>
                 <button class="btn btn-outline-secondary me-2" data-action="csv" data-sample="${si}">Stats CSV</button>
+                <button class="btn btn-outline-secondary me-2" data-action="consensus" data-sample="${si}" data-tip="${escAttr(`Majority-rule consensus of each contig from all mapped reads (any MAPQ; secondary, QC-fail and duplicate reads excluded).\nBases with depth < ${MIN_CONS_DEPTH} are N, deletions are removed, insertions are not added.`)}">Consensus FASTA</button>
                 ${s.unmapped > 0 ? `<button class="btn btn-outline-secondary" data-action="unmapped" data-sample="${si}">Unmapped FASTQ</button>` : ''}
             </div>
             <div class="depth-list-headers depth-item">
@@ -597,6 +593,90 @@ async function downloadUnmapped(si, btn) {
     }
 }
 
+// --- CONSENSUS FASTA (all mapped reads, per contig) ---
+// Same rules as the reads view: per base the most common of A/C/G/T/deletion among the reads,
+// N below MIN_CONS_DEPTH, deleted bases dropped, insertions not added.
+// The BAM is read one region at a time (samtools view contig:s-e) so the SAM text stays small;
+// each region only counts the bases inside it, so reads spanning two regions aren't counted twice.
+const MIN_CONS_DEPTH = 3;
+const CONS_CHUNK_BASES = 2e7; // aim for about this many read bases per region
+
+async function contigConsensus(contig, bam, ref, onProgress) {
+    const L = contig.length;
+    // regions sized by depth; names with ':' can't be given as a region, so read those in one go
+    const chunk = contig.name.includes(':') ? L
+        : Math.max(10_000, Math.min(1_000_000, Math.round(CONS_CHUNK_BASES / Math.max(1, parseFloat(contig.meandepth) || 1))));
+    const parts = [];
+    for (let s = 0; s < L; s += chunk) {
+        const e = Math.min(L, s + chunk), n = e - s;
+        const region = chunk === L ? contig.name : `${contig.name}:${s + 1}-${e}`;
+        const sam = await CLI.exec("samtools", ["view", "-F", EXCLUDE_FLAGS, bam, region]);
+        // difference arrays: +1 at start, -1 at end
+        const span = new Int32Array(n + 1), smallDel = new Int32Array(n + 1), longDel = new Int32Array(n + 1);
+        const mm = { A: new Int32Array(n), C: new Int32Array(n), G: new Int32Array(n), T: new Int32Array(n) };
+        const addRange = (arr, a, b) => { a = Math.max(a, s); b = Math.min(b, e); if (a < b) { arr[a - s]++; arr[b - s]--; } };
+        for (const line of sam.split('\n')) {
+            const r = parseSamRead(line, ref);
+            if (!r || r.end <= s || r.start >= e) continue;
+            for (let b = 0; b < r.blocks.length; b += 2) addRange(span, r.blocks[b], r.blocks[b + 1]);
+            for (let d = 0; d < r.dels.length; d += 2) addRange(r.dels[d + 1] < MIN_GAP_BP ? smallDel : longDel, r.dels[d], r.dels[d] + r.dels[d + 1]);
+            for (let m = 0; m < r.mmPos.length; m++) {
+                const p = r.mmPos[m], b = r.mmBase[m];
+                if (p >= s && p < e && mm[b]) mm[b][p - s]++;
+            }
+        }
+        const out = [];
+        let sp = 0, sd = 0, ld = 0;
+        for (let i = 0; i < n; i++) {
+            sp += span[i]; sd += smallDel[i]; ld += longDel[i];
+            const aligned = Math.max(0, sp - sd), dels = sd + ld;
+            if (aligned + dels < MIN_CONS_DEPTH) { out.push('N'); continue; }
+            const rb = ref[s + i];
+            let mmSum = 0, best = '', bestN = 0;
+            for (const b of 'ACGT') mmSum += mm[b][i];
+            for (const b of 'ACGT') {
+                const c = mm[b][i] + (b === rb ? Math.max(0, aligned - mmSum) : 0); // the rest match the reference
+                if (c > bestN) { best = b; bestN = c; }
+            }
+            if (dels > bestN) continue; // deleted in most reads
+            out.push(best || 'N');
+        }
+        parts.push(out.join(''));
+        onProgress(e / L);
+    }
+    return parts.join('');
+}
+
+async function downloadConsensus(si, btn) {
+    const sm = samples[si];
+    const label = btn.textContent;
+    btn.disabled = true;
+    try {
+        const fasta = [], skipped = [];
+        const total = sm.contigs.reduce((t, c) => t + c.length, 0) || 1;
+        let done = 0;
+        for (const c of sm.contigs) {
+            let ref = '';
+            if (referenceFile && c.length <= MAX_SEQ_BP) ref = await readContigSeq(referenceFile, c.name);
+            if (!ref || ref.length !== c.length) { skipped.push(c.name); done += c.length; continue; }
+            const seq = c.numreads ? await contigConsensus(c, sm.bam, ref, f => {
+                btn.textContent = `Consensus… ${Math.round((done + f * c.length) / total * 100)}%`;
+            }) : 'N'.repeat(c.length);
+            done += c.length;
+            fasta.push(`>${c.name}_consensus sample=${sm.name} min_depth=${MIN_CONS_DEPTH} deletions_removed insertions_not_included`);
+            for (let i = 0; i < seq.length; i += 80) fasta.push(seq.slice(i, i + 80));
+        }
+        if (fasta.length) downloadBlob(new Blob([fasta.join('\n') + '\n'], { type: 'text/plain' }), `${sm.name.replace(/[^\w.-]+/g, '_')}_consensus.fasta`);
+        if (skipped.length) alert(`No consensus for ${skipped.length} contig(s) (reference sequence not available or longer than ${formatBp(MAX_SEQ_BP)}): ${skipped.slice(0, 5).join(', ')}${skipped.length > 5 ? ', …' : ''}`);
+    } catch (err) {
+        console.error(err);
+        alert(`Could not build the consensus: ${err.message || err}`);
+    } finally {
+        btn.disabled = false;
+        btn.textContent = label;
+    }
+}
+
 // Clicks in the results: tabs, combined-summary rows, downloads, contig rows (reads view)
 document.getElementById("results").addEventListener("click", (e) => {
     const tab = e.target.closest('.sample-tabs button, .combined-table tbody tr');
@@ -606,6 +686,7 @@ document.getElementById("results").addEventListener("click", (e) => {
         const si = parseInt(action.dataset.sample, 10);
         if (action.dataset.action === 'csv') downloadStatsCsv(si);
         if (action.dataset.action === 'unmapped') downloadUnmapped(si, action);
+        if (action.dataset.action === 'consensus') downloadConsensus(si, action);
         return;
     }
     const item = e.target.closest('.depth-item[data-index]');
