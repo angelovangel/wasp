@@ -16,6 +16,7 @@ let maxContigLength = 1; // Initialize to 1 to avoid division by zero
 // One entry per sample (= one input fastq): { name, bam, contigs, summary, bamUrl }
 let samples = [];
 let referenceFile = null; // the reference fasta File, read again by the reads view
+let referenceAnnotation = null; // GenBank reference: { name, byContig: Map contig -> features } for the reads view
 const contigSeqCache = new Map();
 
 // Function to reload the page
@@ -233,6 +234,127 @@ function stopProgress() {
 }
 
 // Sample name from a fastq file name: strip .fastq/.fq(.gz)
+// --- REFERENCE: FASTA is used as is; GenBank, FASTQ and gzipped files are converted to FASTA ---
+const wrap80 = (seq) => seq.replace(/(.{80})/g, '$1\n').replace(/\n$/, '');
+
+// GenBank location -> strand + 0-based half-open segments. Handles complement(), join()/order(),
+// partial ends (<, >) and single bases; segments on other records (ACC.1:10..20) and
+// between-base sites (10^11) are skipped.
+function parseGenbankLocation(loc) {
+    const strand = /complement\(/.test(loc) ? '-' : '+';
+    const clean = loc.replace(/[A-Za-z][\w.]*:[<>]?\d+(?:\.\.[<>]?\d+)?/g, '').replace(/\d+\^\d+/g, '');
+    const segs = [...clean.matchAll(/<?(\d+)(?:\.\.>?(\d+))?/g)].map(m => [parseInt(m[1], 10) - 1, parseInt(m[2] || m[1], 10)]);
+    return { strand, segs };
+}
+
+// One GenBank feature -> feature records for the reads view's annotation track:
+// { start, end, strand, type, name, info, blocks? } (blocks = joined segments, as exons)
+function genbankFeature(type, loc, q, L) {
+    const { strand, segs } = parseGenbankLocation(loc);
+    const parts = segs.map(([a, b]) => [Math.max(0, a), Math.min(L, b)]).filter(([a, b]) => b > a).sort((x, y) => x[0] - y[0]);
+    if (!parts.length) return [];
+    const base = {
+        type, strand,
+        name: q.gene || q.locus_tag || q.label || q.standard_name || q.product || type,
+        info: q.product || q.note || ''
+    };
+    const covered = parts.reduce((t, [a, b]) => t + b - a, 0);
+    const end = Math.max(...parts.map(p => p[1]));
+    // a join across the origin of a circular sequence (e.g. join(9000..10000,1..200)): draw the pieces
+    if (parts.length > 1 && end - parts[0][0] - covered > L / 2) return parts.map(([a, b]) => ({ ...base, start: a, end: b }));
+    const f = { ...base, start: parts[0][0], end };
+    if (parts.length > 1) {
+        const blocks = [];
+        for (const [a, b] of parts) {
+            if (blocks.length && a <= blocks[blocks.length - 1]) blocks[blocks.length - 1] = Math.max(blocks[blocks.length - 1], b);
+            else blocks.push(a, b);
+        }
+        if (blocks.length > 2) f.blocks = blocks;
+    }
+    return [f];
+}
+
+// GenBank (one or more records): name from LOCUS, sequence from ORIGIN, features from the
+// FEATURES table (except 'source'). Returns { fasta, annotation: Map contig -> features }.
+function parseGenbank(text) {
+    const out = [], annotation = new Map();
+    let name = null, section = '', seq = [], raw = [], cur = null, qual = null;
+    const endFeature = () => { if (cur) raw.push(cur); cur = null; qual = null; };
+    const flush = () => {
+        endFeature();
+        if (name && seq.length) {
+            const s = seq.join('').toUpperCase();
+            out.push(`>${name}\n${wrap80(s)}`);
+            const feats = raw.filter(f => f.type !== 'source').flatMap(f => {
+                const q = {};
+                for (const [k, v] of f.q) if (!(k in q)) q[k] = v.replace(/^"|"$/g, '').replace(/""/g, '"');
+                return genbankFeature(f.type, f.loc, q, s.length);
+            });
+            if (feats.length) annotation.set(name, feats);
+        }
+        name = null; section = ''; seq = []; raw = [];
+    };
+    for (const line of text.split(/\r?\n/)) {
+        if (line.startsWith('LOCUS')) { flush(); name = line.split(/\s+/)[1] || `record_${out.length + 1}`; continue; }
+        if (line.startsWith('//')) { flush(); continue; }
+        if (/^[A-Z]/.test(line)) { // a new top-level keyword: FEATURES, ORIGIN, CONTIG, BASE COUNT, ...
+            endFeature();
+            section = line.startsWith('FEATURES') ? 'features' : line.startsWith('ORIGIN') ? 'origin' : '';
+            continue;
+        }
+        if (section === 'origin') { seq.push(line.replace(/[^A-Za-z]/g, '')); continue; }
+        if (section !== 'features') continue;
+        const key = line.match(/^ {5}(\S+)\s+(.*)$/);
+        if (key) { endFeature(); cur = { type: key[1], loc: key[2].trim(), q: [] }; continue; }
+        if (!cur) continue;
+        const body = line.trim();
+        const qm = body.match(/^\/(\w+)(?:=(.*))?$/);
+        if (qm) { qual = [qm[1], qm[2] ?? '']; if (qm[1] !== 'translation') cur.q.push(qual); continue; }
+        if (qual) { if (qual[0] !== 'translation') qual[1] += ' ' + body; }  // continued qualifier value
+        else cur.loc += body;                                                   // continued location
+    }
+    flush(); // last record without a closing //
+    if (!out.length) throw new Error('no sequence found in the GenBank file (records need an ORIGIN section)');
+    return { fasta: out.join('\n') + '\n', annotation };
+}
+
+// FASTQ (4 lines per record): keep the header and sequence, drop the qualities
+function fastqToFasta(text) {
+    const lines = text.split(/\r?\n/), out = [];
+    for (let i = 0; i + 1 < lines.length; i += 4) {
+        if (!lines[i]) { i -= 3; continue; } // skip blank lines
+        if (lines[i][0] !== '@') throw new Error(`unexpected FASTQ line ${i + 1}: records must be 4 lines (@name, sequence, +, qualities)`);
+        out.push(`>${lines[i].slice(1)}\n${wrap80(lines[i + 1].trim().toUpperCase())}`);
+    }
+    if (!out.length) throw new Error('no records found in the FASTQ file');
+    return out.join('\n') + '\n';
+}
+
+async function referenceAsFasta(file) {
+    const gz = /\.gz$/i.test(file.name);
+    const readText = () => gz
+        ? new Response(file.stream().pipeThrough(new DecompressionStream('gzip'))).text()
+        : file.text();
+    // detect the format from the first non-blank line (decompressing only for .gz)
+    const head = gz ? await readText() : await file.slice(0, 65536).text();
+    const first = head.trimStart();
+    const base = file.name.replace(/\.gz$/i, '').replace(/\.[^.]+$/, '') || 'reference';
+    let fasta, annotation = null;
+    if (first[0] === '>') {
+        if (!gz) return { file, annotation: null }; // plain FASTA: use the file directly
+        fasta = head;
+    } else if (first.startsWith('LOCUS')) {
+        const gb = parseGenbank(gz ? head : await readText());
+        fasta = gb.fasta;
+        annotation = gb.annotation.size ? { name: file.name, byContig: gb.annotation } : null;
+    } else if (first[0] === '@') {
+        fasta = fastqToFasta(gz ? head : await readText());
+    } else {
+        throw new Error(`could not recognise the reference format of ${file.name} (expected FASTA, GenBank or FASTQ)`);
+    }
+    return { file: new File([fasta], `${base}.fasta`, { type: 'text/plain' }), annotation };
+}
+
 function sampleNameFromFile(fileName) {
     return fileName.replace(/\.(fastq|fq)(\.gz)?$/i, '').replace(/\.gz$/i, '') || fileName;
 }
@@ -359,8 +481,11 @@ async function run() {
 
         setProgress(2, "Loading files…");
         const queryPaths = await CLI.mount(q);
-        const refPath = (await CLI.mount(r))[0];
-        referenceFile = r[0];
+        setProgress(3, "Reading reference…");
+        const { file: refFile, annotation } = await referenceAsFasta(r[0]);
+        referenceAnnotation = annotation;
+        const refPath = (await CLI.mount([refFile]))[0];
+        referenceFile = refFile;
         contigSeqCache.clear();
 
         // One sample per fastq file; make names unique
@@ -376,7 +501,7 @@ async function run() {
         // With several samples, build the minimap2 index once and reuse it
         // (skipped for big references, where the .mmi copy would cost too much memory)
         let target = refPath;
-        if (jobs.length > 1 && r[0].size <= MMI_MAX_REF_BYTES) {
+        if (jobs.length > 1 && refFile.size <= MMI_MAX_REF_BYTES) {
             setProgress(4, "Indexing reference…");
             await CLI.exec("minimap2", ["-x", preset, "-d", "ref.mmi", refPath]);
             target = "ref.mmi";
@@ -857,7 +982,9 @@ async function sendReadsTo(win, sm, contig, ready) {
         const { total, fraction, reads, ref } = await fetchContigReads(contig, sm.bam);
         payload = {
             contig: { name: contig.name, length: contig.length, meandepth: contig.meandepth, coverage: contig.coverage, binSize: contig.binSize },
-            sample: sm.name, profile: contig.profile, total, fraction, reads, ref, limit: MAX_VIEW_READS
+            sample: sm.name, profile: contig.profile, total, fraction, reads, ref, limit: MAX_VIEW_READS,
+            annotation: referenceAnnotation?.byContig.has(contig.name)
+                ? { name: referenceAnnotation.name, features: referenceAnnotation.byContig.get(contig.name) } : null
         };
     } catch (err) {
         console.error(err);

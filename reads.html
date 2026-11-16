@@ -1373,8 +1373,11 @@ Features on this contig are drawn under the consensus; the file is remembered fo
         $('viewer').hidden = false;
         filtered = data.reads.filter(r => r.mapq >= minMapq);
         repack();
-        // annotation loaded in another contig view
-        try {
+        // annotation: from a GenBank reference (sent with the reads), else a file loaded in another contig view
+        if (data.annotation?.features?.length) {
+            featFile = data.annotation.name; featAll = data.annotation.features; featOther = []; featType = 'all';
+            updateFeatureUI();
+        } else try {
             const s = JSON.parse(localStorage.getItem(FEAT_STORE_KEY));
             if (s?.text) {
                 const res = parseFeatures(s.text, s.name, c.name);

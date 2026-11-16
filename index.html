@@ -16,8 +16,8 @@
         <h2 class="mb-4">wasp <small class="text-muted fs-6 fw-normal">read alignment in the browser</small></h2>
         <div class="row" id="inputs">
             <div class="col-md-4 file-input">
-                <label for="ref" class="form-label fw-bold">1. Reference (.fasta/.fa)</label>
-                <input type="file" id="ref" class="form-control" accept=".fasta,.fa">
+                <label for="ref" class="form-label fw-bold">1. Reference (FASTA, GenBank, FASTQ)</label>
+                <input type="file" id="ref" class="form-control" accept=".fasta,.fa,.fna,.fas,.gb,.gbk,.gbff,.genbank,.fastq,.fq,.gz">
             </div>
 
             <div class="col-md-4 file-input">
@@ -59,7 +59,7 @@
         <div id="output">
             <p id="initial-message" class="text-muted">
                 Upload your files and click 'Run Analysis', no data leaves the browser.
-                The reference can have multiple entries. Each selected fastq file is treated as a separate sample.
+                The reference can have multiple entries (FASTA, GenBank or FASTQ, optionally gzipped). Each selected fastq file is treated as a separate sample.
             </p>
         </div>
         
