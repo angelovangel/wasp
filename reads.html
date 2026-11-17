@@ -64,6 +64,16 @@
         button:disabled { opacity: 0.5; cursor: default; }
         label.group { cursor: pointer; }
 
+        /* one chip per annotation track */
+        .feat-tracks { display: flex; flex-wrap: wrap; gap: 4px 8px; margin: -4px 0 8px; font-size: 0.8rem; }
+        .feat-chip {
+            display: inline-flex; align-items: center; gap: 5px;
+            border: 1px solid var(--line); background: var(--panel); padding: 1px 2px 1px 6px;
+        }
+        .feat-chip .sw { width: 10px; height: 10px; }
+        .feat-chip .n { color: var(--muted); }
+        .feat-chip select, .feat-chip button { font-size: 0.75rem; padding: 0 5px; border: 0; }
+
         .variants { margin-top: 10px; background: var(--panel); border: 1px solid var(--line); }
         .variants > summary { padding: 6px 10px; cursor: pointer; font-weight: 500; }
         .var-controls { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 14px; padding: 0 10px 8px; }
@@ -109,9 +119,9 @@
     <div id="viewer" hidden>
         <div class="toolbar">
             <div class="group">
-                <button id="zoom-out" data-tip="Zoom out">−</button>
-                <button id="zoom-in" data-tip="Zoom in">+</button>
-                <button id="zoom-reset" data-tip="Show whole contig">All</button>
+                <button id="zoom-out" data-tip="Zoom out. Tip: drag across the depth plot to zoom to a region">−</button>
+                <button id="zoom-in" data-tip="Zoom in. Tip: drag across the depth plot to zoom to a region">+</button>
+                <button id="zoom-reset" data-tip="Show the whole contig (or double-click the depth plot, or press Esc)">All</button>
             </div>
             <form class="group" id="goto-form">
                 <input id="goto" type="text" placeholder="1.2M-1.25M" size="11" aria-label="Go to position or region" data-tip="Go to a position or region, e.g. 1,200,000 or 1.2M-1.25M, or a feature name from the loaded annotation">
@@ -170,15 +180,14 @@
             </div>
             <label class="group" data-tip="Show soft-clipped read ends"><input type="checkbox" id="show-clips" checked> clips</label>
             <div class="sep"></div>
-            <div class="group" data-tip="Load a BED, GFF3 or GTF annotation (optionally .gz), or drop one on the page.
-Features on this contig are drawn under the consensus; the file is remembered for other contig views.">
+            <div class="group" data-tip="Add BED, GFF3 or GTF annotation files (optionally .gz), or drop them on the page.
+Each file is a track under the consensus; loaded files are remembered for other contig views.">
                 <button id="feat-btn">Features…</button>
-                <input type="file" id="feat-file" accept=".bed,.gff,.gff3,.gtf,.gz,.txt,.tsv" hidden>
-                <select id="feat-type" hidden aria-label="Feature type"></select>
+                <input type="file" id="feat-file" accept=".bed,.gff,.gff3,.gtf,.gz,.txt,.tsv" multiple hidden>
                 <span id="feat-note" class="note"></span>
-                <button id="feat-clear" data-tip="Remove the annotation track" hidden>×</button>
             </div>
         </div>
+        <div id="feat-tracks" class="feat-tracks" hidden></div>
         <div class="legend">
             <span><i class="sw" style="background:var(--fwd)"></i>forward</span>
             <span><i class="sw" style="background:var(--rev)"></i>reverse</span>
@@ -300,12 +309,12 @@ Features on this contig are drawn under the consensus; the file is remembered fo
     let maxRows = 250;        // 0 = no limit
     let hiddenReads = 0;      // reads left out of the pile by the depth limit
     let counts = null;        // per-base counts for the detail window (see computeCounts)
-    let featFile = '';        // name of the loaded annotation file ('' = none)
-    let featAll = [];         // its features on this contig: { start, end, strand, name, type, blocks, color, info }
-    let featOther = [];       // other sequence names in the file (shown when none match this contig)
-    let featType = 'all';     // feature type shown
-    let featShown = [];       // featAll filtered by type, each packed into f.row
-    let featRows = 0;
+    // Annotation tracks, drawn top to bottom under the consensus:
+    //   { name, source: 'reference' | 'file', text (file tracks, for remembering),
+    //     all: features on this contig { start, end, strand, name, type, blocks, thick, color, info },
+    //     other: other sequence names in the file, type: type shown ('all'),
+    //     shown: `all` filtered by type and packed (f.row), rows, y0/h: layout in the top canvas }
+    let tracks = [];
 
     // ---- annotation (BED / GFF3 / GTF) ----
     function gffAttrs(s) {
@@ -318,6 +327,15 @@ Features on this contig are drawn under the consensus; the file is remembered fo
             try { a[m[1]] = decodeURIComponent(m[2]); } catch { a[m[1]] = m[2]; }
         }
         return a;
+    }
+
+    // GFF colour attribute as IGV reads it: color=#rrggbb, #rgb or r,g,b
+    function gffColor(v) {
+        if (!v) return undefined;
+        v = v.trim();
+        if (/^#([0-9a-f]{3}|[0-9a-f]{6})$/i.test(v)) return v;
+        if (/^\d{1,3},\d{1,3},\d{1,3}$/.test(v)) return `rgb(${v})`;
+        return undefined;
     }
 
     // Returns { features (this contig only, 0-based half-open), others: other seq names }
@@ -343,6 +361,7 @@ Features on this contig are drawn under the consensus; the file is remembered fo
                     start: parseInt(f[3], 10) - 1, end: parseInt(f[4], 10), strand: f[6], type: f[2],
                     name: a.Name || a.gene || a.gene_name || a.locus_tag || a.ID || a.gene_id || a.transcript_id || f[2],
                     info: a.product || a.Note || a.description || '',
+                    color: gffColor(a.color || a.colour),
                     // for exon grouping: GFF3 ID/Parent, GTF transcript_id
                     id: gtf ? (f[2] === 'transcript' ? a.transcript_id : null) : a.ID,
                     parents: gtf ? (f[2] === 'transcript' ? [] : [a.transcript_id]) : (a.Parent ? a.Parent.split(',') : []),
@@ -356,8 +375,12 @@ Features on this contig are drawn under the consensus; the file is remembered fo
                     const sizes = f[10].split(',').map(Number), starts = f[11].split(',').map(Number);
                     feat.blocks = [];
                     for (let i = 0; i < n; i++) feat.blocks.push(feat.start + starts[i], feat.start + starts[i] + sizes[i]);
-                    const ts = parseInt(f[6], 10), te = parseInt(f[7], 10);
-                    if (te >= ts) feat.thick = [ts, te]; // coding part; thickStart == thickEnd: non-coding
+                }
+                // BED8+: thickStart/thickEnd = coding part (thickStart == thickEnd: non-coding, all thin)
+                const ts = parseInt(f[6], 10), te = parseInt(f[7], 10);
+                if (f.length >= 8 && te >= ts) {
+                    feat.thick = [ts, te];
+                    if (!feat.blocks) feat.blocks = [feat.start, feat.end]; // single exon: drawn by the block path
                 }
             }
             if (!(feat.end > feat.start)) continue;
@@ -395,7 +418,7 @@ Features on this contig are drawn under the consensus; the file is remembered fo
             if (!parent) {
                 if (!parts[0].gtf) continue; // GFF3 part whose parent is missing: keep it as is
                 // GTF without transcript lines: make the transcript from its parts
-                parent = { start: Infinity, end: 0, strand: parts[0].strand, type: 'transcript', name: parts[0].name, info: '' };
+                parent = { start: Infinity, end: 0, strand: parts[0].strand, type: 'transcript', name: pid, info: '', color: parts[0].color };
                 byId.set(pid, parent); added.push(parent);
             }
             // merge the parts into sorted, non-overlapping blocks
@@ -414,75 +437,133 @@ Features on this contig are drawn under the consensus; the file is remembered fo
             }
             for (const p of k.all) drop.add(p);
         }
+        // features without a colour take their parent's (e.g. an mRNA under a coloured gene)
+        for (const f of feats) {
+            const p = !f.color && f.parents?.length && byId.get(f.parents[0]);
+            if (p?.color) f.color = p.color;
+        }
         return feats.filter(f => !drop.has(f)).concat(added);
     }
 
-    function packFeatures() {
-        featShown = featAll.filter(f => featType === 'all' || f.type === featType).sort((a, b) => a.start - b.start || b.end - a.end);
+    function packTrack(t) {
+        t.shown = t.all.filter(f => t.type === 'all' || f.type === t.type).sort((a, b) => a.start - b.start || b.end - a.end);
         const ends = [];
-        for (const f of featShown) {
+        for (const f of t.shown) {
             let i = ends.findIndex(e => e <= f.start);
             if (i === -1) { i = ends.length; ends.push(0); }
             ends[i] = f.end; f.row = i;
         }
-        featRows = ends.length;
+        t.rows = ends.length;
     }
 
-    const featTrackH = () => !featFile ? 0 : featShown.length ? FEAT_TOP + featRows * FEAT_ROW_H : FEAT_TOP + 4;
+    // Lays the tracks out below the consensus; returns their total height
+    function featTrackH() {
+        let y = 0;
+        for (const t of tracks) {
+            t.y0 = y;
+            t.h = t.shown.length ? FEAT_TOP + t.rows * FEAT_ROW_H : FEAT_TOP + 4;
+            y += t.h;
+        }
+        return y;
+    }
+
+    const trackColor = t => t.all.find(f => f.color)?.color || COL.feat;
 
     function updateFeatureUI() {
-        const types = new Map();
-        for (const f of featAll) types.set(f.type, (types.get(f.type) || 0) + 1);
-        if (featType !== 'all' && !types.has(featType)) featType = 'all';
-        const sel = $('feat-type');
-        sel.innerHTML = [`<option value="all">all types</option>`,
-            ...[...types].sort((a, b) => b[1] - a[1]).map(([t, n]) => `<option value="${esc(t)}">${esc(t)} (${n})</option>`)].join('');
-        sel.value = featType;
-        sel.hidden = types.size < 2;
-        $('feat-clear').hidden = !featFile;
-        $('feat-note').textContent = featFile ? `${featFile}: ${featAll.length.toLocaleString()}` : '';
-        packFeatures();
+        const box = $('feat-tracks');
+        box.hidden = !tracks.length;
+        box.innerHTML = tracks.map((t, i) => {
+            const types = new Map();
+            for (const f of t.all) types.set(f.type, (types.get(f.type) || 0) + 1);
+            if (t.type !== 'all' && !types.has(t.type)) t.type = 'all';
+            const sel = types.size < 2 ? '' :
+                `<select data-i="${i}" aria-label="Feature type">` +
+                [`<option value="all">all types</option>`,
+                 ...[...types].sort((a, b) => b[1] - a[1]).map(([ty, n]) =>
+                    `<option value="${esc(ty)}"${ty === t.type ? ' selected' : ''}>${esc(ty)} (${n})</option>`)].join('') +
+                `</select>`;
+            const tip = t.source === 'reference' ? 'features from the GenBank reference'
+                : t.remembered === false ? 'too large to remember for other contig views' : 'remembered for other contig views';
+            return `<span class="feat-chip" data-tip="${esc(`${t.name}\n${tip}`)}">` +
+                `<i class="sw" style="background:${esc(trackColor(t))}"></i>${esc(t.name)}` +
+                `<span class="n">${t.all.length.toLocaleString()}</span>${sel}` +
+                `<button data-remove="${i}" data-tip="Remove this track">×</button></span>`;
+        }).join('');
+        for (const t of tracks) packTrack(t);
     }
 
-    function loadFeatures(text, name, remember) {
-        const res = parseFeatures(text, name, data.contig.name);
-        featFile = name; featAll = res.features; featOther = res.others;
-        updateFeatureUI();
-        render();
-        if (remember) {
-            try { localStorage.setItem(FEAT_STORE_KEY, JSON.stringify({ name, text, type: featType })); }
-            catch { try { localStorage.removeItem(FEAT_STORE_KEY); } catch {} } // too large to remember: fine
-        }
+    function makeTrack(name, source, res, extra = {}) {
+        return { name, source, all: res.features, other: res.others, type: 'all', shown: [], rows: 0, ...extra };
     }
 
-    async function readFeatureFile(file) {
+    // Remember the file tracks for other contig views. If they don't all fit in browser
+    // storage, the largest are left out (and marked) until the rest fit.
+    function saveTracks() {
+        const files = tracks.filter(t => t.source === 'file');
+        let keep = [...files].sort((a, b) => a.text.length - b.text.length);
+        for (const t of files) t.remembered = true;
         try {
-            const text = /\.gz$/i.test(file.name)
-                ? await new Response(file.stream().pipeThrough(new DecompressionStream('gzip'))).text()
-                : await file.text();
-            loadFeatures(text, file.name, true);
-        } catch (err) {
-            $('feat-note').textContent = `could not read ${file.name}`;
-        }
+            while (true) {
+                try {
+                    if (keep.length) localStorage.setItem(FEAT_STORE_KEY, JSON.stringify(
+                        files.filter(t => keep.includes(t)).map(t => ({ name: t.name, text: t.text, type: t.type }))));
+                    else localStorage.removeItem(FEAT_STORE_KEY);
+                    break;
+                } catch (err) {
+                    if (!keep.length) throw err;
+                    keep.pop().remembered = false; // drop the largest and retry
+                }
+            }
+        } catch {} // storage unavailable: tracks still work in this view
     }
 
-    function clearFeatures() {
-        featFile = ''; featAll = []; featOther = []; featType = 'all';
-        try { localStorage.removeItem(FEAT_STORE_KEY); } catch {}
+    function addTrack(text, name) {
+        const t = makeTrack(name, 'file', parseFeatures(text, name, data.contig.name), { text });
+        const i = tracks.findIndex(x => x.source === 'file' && x.name === name); // same file again: replace it
+        if (i >= 0) { t.type = tracks[i].type; tracks[i] = t; } else tracks.push(t);
+        saveTracks();
         updateFeatureUI();
         render();
     }
 
-    function drawFeatures(ctx, w, y0) {
-        if (!featFile) return;
+    async function readFeatureFiles(files) {
+        const failed = [];
+        for (const file of files) {
+            try {
+                const text = /\.gz$/i.test(file.name)
+                    ? await new Response(file.stream().pipeThrough(new DecompressionStream('gzip'))).text()
+                    : await file.text();
+                addTrack(text, file.name);
+            } catch (err) {
+                failed.push(file.name);
+            }
+        }
+        $('feat-note').textContent = failed.length ? `could not read ${failed.join(', ')}` : '';
+    }
+
+    function removeTrack(i) {
+        tracks.splice(i, 1);
+        saveTracks();
+        updateFeatureUI();
+        render();
+    }
+
+    function drawFeatures(ctx, w, top) {
+        for (const t of tracks) drawTrack(ctx, w, top + t.y0, t);
+    }
+
+    function drawTrack(ctx, w, y0, t) {
         ctx.font = '10px system-ui, sans-serif';
         ctx.textBaseline = 'top';
         ctx.textAlign = 'left';
+        ctx.fillStyle = COL.line;
+        ctx.fillRect(0, y0, w, 1);
         ctx.fillStyle = COL.muted;
-        ctx.fillText(featShown.length ? `features (${featFile})`
-            : `${featFile}: no features on this contig${featOther.length ? ` (file has ${featOther.slice(0, 3).join(', ')}${featOther.length > 3 ? ', …' : ''})` : ''}`, 6, y0 + 2);
-        const lastLabelEnd = new Array(featRows).fill(-Infinity);
-        for (const f of featShown) {
+        ctx.fillText(t.shown.length ? `${t.name}${t.type !== 'all' ? ` · ${t.type}` : ''}`
+            : t.all.length ? `${t.name}: no ${t.type} features`
+            : `${t.name}: no features on this contig${t.other.length ? ` (file has ${t.other.slice(0, 3).join(', ')}${t.other.length > 3 ? ', …' : ''})` : ''}`, 6, y0 + 2);
+        const lastLabelEnd = new Array(t.rows).fill(-Infinity);
+        for (const f of t.shown) {
             if (f.end < view.start || f.start > view.end) continue;
             const y = y0 + FEAT_TOP + f.row * FEAT_ROW_H;
             const x0 = xOf(f.start, w), x1 = xOf(f.end, w);
@@ -528,18 +609,19 @@ Features on this contig are drawn under the consensus; the file is remembered fo
         }
     }
 
-    // Feature under the mouse on the top canvas (null outside the annotation track)
+    // Feature under the mouse on the top canvas (null outside the annotation tracks)
     function featureAt(e) {
-        if (!featShown.length) return null;
         const rect = covCanvas.getBoundingClientRect();
-        const yy = e.clientY - rect.top - (COV_H + RULER_H + CONS_H + FEAT_TOP);
-        if (yy < 0) return null;
-        const row = Math.floor(yy / FEAT_ROW_H);
+        const yy = e.clientY - rect.top - (COV_H + RULER_H + CONS_H);
+        const t = tracks.find(t => yy >= t.y0 && yy < t.y0 + t.h);
+        if (!t || yy < t.y0 + FEAT_TOP) return null;
+        const row = Math.floor((yy - t.y0 - FEAT_TOP) / FEAT_ROW_H);
         const bp = bpAtEvent(e, covCanvas);
         const tol = (view.end - view.start) / rect.width * 2;
-        return featShown.find(f => f.row === row && bp >= f.start - tol && bp <= f.end + tol) || null;
+        const f = t.shown.find(f => f.row === row && bp >= f.start - tol && bp <= f.end + tol);
+        return f ? { f, track: t } : null;
     }
-    const inFeatureTrack = e => featFile && e.clientY - covCanvas.getBoundingClientRect().top >= COV_H + RULER_H + CONS_H;
+    const inFeatureTrack = e => tracks.length && e.clientY - covCanvas.getBoundingClientRect().top >= COV_H + RULER_H + CONS_H;
 
     function goToFeature(f) {
         const pad = Math.max(20, (f.end - f.start) * 0.1);
@@ -823,6 +905,7 @@ Features on this contig are drawn under the consensus; the file is remembered fo
         }
         drawFeatures(ctx, w, COV_H + RULER_H + CONS_H);
         drawGroupMarker(ctx, w, topH);
+        drawSelection(ctx, w, topH);
     }
 
     function drawReads() {
@@ -922,6 +1005,7 @@ Features on this contig are drawn under the consensus; the file is remembered fo
             ctx.fillText(`${h.n.toLocaleString()} reads`, 6 + lw + 8, h.y + 4);
         }
         drawGroupMarker(ctx, w, readsHeight);
+        drawSelection(ctx, w, readsHeight);
     }
 
     // Diagonal-stripe fill for supplementary alignments, cached per colour
@@ -996,6 +1080,20 @@ Features on this contig are drawn under the consensus; the file is remembered fo
         ctx.strokeRect(Math.round(x0) - 0.5, 0.5, Math.max(1, Math.round(x1 - x0)) + 1, h - 1);
         ctx.setLineDash([]);
         ctx.globalAlpha = 1;
+    }
+
+    // Region being selected by dragging across the depth plot (zooms there on release)
+    let sel = null; // { x, a, b, active }
+    function drawSelection(ctx, w, h) {
+        if (!sel?.active) return;
+        const x0 = xOf(Math.min(sel.a, sel.b), w), x1 = xOf(Math.max(sel.a, sel.b), w);
+        ctx.globalAlpha = 0.15;
+        ctx.fillStyle = COL.accent;
+        ctx.fillRect(x0, 0, x1 - x0, h);
+        ctx.globalAlpha = 1;
+        ctx.strokeStyle = COL.accent;
+        ctx.lineWidth = 1;
+        ctx.strokeRect(Math.round(x0) + 0.5, 0.5, Math.max(1, Math.round(x1 - x0) - 1), h - 1);
     }
 
     function render() {
@@ -1132,7 +1230,8 @@ Features on this contig are drawn under the consensus; the file is remembered fo
         }
         // otherwise a feature name: exact match first, then substring
         const q = text.trim().toLowerCase();
-        const f = q && (featAll.find(f => f.name.toLowerCase() === q) || featAll.find(f => f.name.toLowerCase().includes(q)));
+        const all = tracks.flatMap(t => t.all);
+        const f = q && (all.find(f => f.name.toLowerCase() === q) || all.find(f => f.name.toLowerCase().includes(q)));
         if (f) { goToFeature(f); return true; }
         return false;
     }
@@ -1222,7 +1321,7 @@ Features on this contig are drawn under the consensus; the file is remembered fo
     const hideTooltip = () => { tooltip.style.display = 'none'; tooltip.classList.remove('wrap'); };
 
     // Instant tooltips for toolbar controls with data-tip (native title tooltips take ~1 s)
-    document.querySelector('.toolbar').addEventListener('mousemove', e => {
+    const onTipMove = e => {
         const el = e.target.closest('[data-tip]');
         if (!el) return hideTooltip();
         tooltip.textContent = el.dataset.tip;
@@ -1230,8 +1329,11 @@ Features on this contig are drawn under the consensus; the file is remembered fo
         tooltip.style.display = 'block';
         tooltip.style.left = `${Math.min(e.clientX + 12, window.innerWidth - tooltip.offsetWidth - 8)}px`;
         tooltip.style.top = `${e.clientY + 14}px`;
-    });
-    document.querySelector('.toolbar').addEventListener('mouseleave', hideTooltip);
+    };
+    for (const el of [document.querySelector('.toolbar'), $('feat-tracks')]) {
+        el.addEventListener('mousemove', onTipMove);
+        el.addEventListener('mouseleave', hideTooltip);
+    }
 
     readsCanvas.addEventListener('mousemove', e => {
         if (!data || drag) return hideTooltip();
@@ -1259,12 +1361,15 @@ Features on this contig are drawn under the consensus; the file is remembered fo
 
     // Coverage/consensus hover: base counts at that position
     covCanvas.addEventListener('mousemove', e => {
+        if (sel?.active) return;
         if (data && inFeatureTrack(e)) {
-            const f = featureAt(e);
-            covCanvas.style.cursor = f ? 'pointer' : '';
-            if (!f) return hideTooltip();
+            const hit = featureAt(e);
+            covCanvas.style.cursor = hit ? 'pointer' : '';
+            if (!hit) return hideTooltip();
+            const f = hit.f;
             return showTooltip(
-                `<b>${esc(f.name || f.type)}</b>${f.type !== 'BED' ? ` · ${esc(f.type)}` : ''}<br>` +
+                `<b>${esc(f.name || f.type)}</b>${f.type !== 'BED' ? ` · ${esc(f.type)}` : ''}` +
+                (tracks.length > 1 ? ` <span style="opacity:.7">(${esc(hit.track.name)})</span>` : '') + '<br>' +
                 `${(f.start + 1).toLocaleString()}–${f.end.toLocaleString()} (${fmtBp(f.end - f.start)})` +
                 (f.strand === '+' || f.strand === '-' ? ` · ${f.strand} strand` : '') +
                 (f.blocks ? ` · ${f.blocks.length / 2} exon${f.blocks.length > 2 ? 's' : ''}` : '') +
@@ -1281,11 +1386,11 @@ Features on this contig are drawn under the consensus; the file is remembered fo
             `depth ${tot} · ${(counts.alt[i] * 100).toFixed(0)}% disagree<br>${parts} · del ${counts.del[i]}` +
             (counts.clip[i] ? `<br>${counts.clip[i]} reads soft-clipped here` : ''), e);
     });
-    covCanvas.addEventListener('mouseleave', hideTooltip);
+    covCanvas.addEventListener('mouseleave', () => { if (!sel?.active) hideTooltip(); });
 
     $('zoom-in').addEventListener('click', () => zoomAt(0.5, (view.start + view.end) / 2));
     $('zoom-out').addEventListener('click', () => zoomAt(2, (view.start + view.end) / 2));
-    $('zoom-reset').addEventListener('click', () => setView(0, data.contig.length));
+    $('zoom-reset').addEventListener('click', () => zoomAll());
     $('row-height').addEventListener('change', e => { rowH = parseInt(e.target.value, 10); repack(); render(); });
     $('group-by').addEventListener('change', e => {
         groupBy = e.target.value;
@@ -1312,10 +1417,70 @@ Features on this contig are drawn under the consensus; the file is remembered fo
         input.style.borderColor = ok ? '' : '#b02a37';
     });
 
+    // Drag across the depth plot (coverage, ruler, consensus) to select a region and zoom to it
+    const clampBp = bp => Math.max(0, Math.min(data.contig.length, bp));
+    let justSelected = false;
+    covCanvas.addEventListener('mousedown', e => {
+        if (!data || e.button !== 0 || inFeatureTrack(e)) return;
+        e.preventDefault(); // no text selection while dragging
+        const bp = clampBp(bpAtEvent(e, covCanvas));
+        sel = { x: e.clientX, a: bp, b: bp, active: false };
+    });
+    window.addEventListener('mousemove', e => {
+        if (!sel) return;
+        sel.b = clampBp(bpAtEvent(e, covCanvas));
+        if (!sel.active && Math.abs(e.clientX - sel.x) < 4) return; // still a click
+        sel.active = true;
+        hideTooltip();
+        drawTopTracks(); drawReads(); // the view itself doesn't change while dragging
+        showTooltip(`${(Math.floor(Math.min(sel.a, sel.b)) + 1).toLocaleString()}–${Math.ceil(Math.max(sel.a, sel.b)).toLocaleString()} ` +
+            `(${fmtBp(Math.abs(sel.b - sel.a))})<br><i>release to zoom · Esc to cancel</i>`, e);
+    });
+    window.addEventListener('mouseup', () => {
+        if (!sel) return;
+        const s0 = sel;
+        sel = null;
+        if (!s0.active) return; // a plain click: handled by the click listener
+        justSelected = true;      // swallow the click that follows this mouseup
+        setTimeout(() => { justSelected = false; }, 0);
+        hideTooltip();
+        // grouping by base needs a single base: a region selection turns it off again
+        if (groupBy === 'base') { groupBy = 'none'; $('group-by').value = 'none'; repack(); }
+        setView(Math.min(s0.a, s0.b), Math.max(s0.a, s0.b));
+    });
+    // Esc: cancel a selection in progress, otherwise zoom back to the whole contig
+    window.addEventListener('keydown', e => {
+        if (e.key !== 'Escape' || !data) return;
+        if (sel) { sel = null; hideTooltip(); render(); return; }
+        if (e.target.closest('input, select, textarea')) return;
+        zoomAll();
+    });
+
+    function zoomAll() {
+        if (groupBy === 'base') { groupBy = 'none'; $('group-by').value = 'none'; repack(); } // whole contig: not one base
+        setView(0, data.contig.length);
+    }
+
+    // Double-click the depth plot: whole contig. The two clicks before the dblclick event
+    // would group by base, so the grouping from before them is put back first.
+    let clickState = { t: 0 };
+    covCanvas.addEventListener('dblclick', e => {
+        if (!data || inFeatureTrack(e)) return;
+        if (performance.now() - clickState.t < 1000) {
+            groupBy = clickState.groupBy; groupPos = clickState.groupPos;
+            $('group-by').value = groupBy;
+            repack();
+        }
+        zoomAll();
+    });
+
     // Click on coverage/consensus: group reads by their base at that position
     covCanvas.addEventListener('click', e => {
-        if (!data) return;
-        if (inFeatureTrack(e)) { const f = featureAt(e); if (f) goToFeature(f); return; }
+        if (!data || justSelected) return;
+        if (inFeatureTrack(e)) { const hit = featureAt(e); if (hit) goToFeature(hit.f); return; }
+        // remember the grouping before the first click of a possible double-click
+        const now = performance.now();
+        if (now - clickState.t > 500) clickState = { t: now, groupBy, groupPos }; else clickState.t = now;
         groupPos = Math.max(0, Math.min(data.contig.length - 1, Math.floor(bpAtEvent(e, covCanvas))));
         groupBy = 'base';
         $('group-by').value = 'base';
@@ -1323,27 +1488,29 @@ Features on this contig are drawn under the consensus; the file is remembered fo
     });
     $('max-rows').addEventListener('change', e => { maxRows = parseInt(e.target.value, 10); if (data) { repack(); render(); } });
 
-    // Annotation upload: button, file picker, or drag-and-drop anywhere on the page
+    // Annotation upload: button, file picker (several files at once), or drag-and-drop anywhere on the page
     $('feat-btn').addEventListener('click', () => $('feat-file').click());
     $('feat-file').addEventListener('change', e => {
-        const file = e.target.files[0];
-        if (file && data) readFeatureFile(file);
+        if (e.target.files.length && data) readFeatureFiles([...e.target.files]);
         e.target.value = ''; // allow re-picking the same file
     });
-    $('feat-clear').addEventListener('click', clearFeatures);
-    $('feat-type').addEventListener('change', e => {
-        featType = e.target.value;
-        packFeatures(); render();
-        try {
-            const s = JSON.parse(localStorage.getItem(FEAT_STORE_KEY));
-            if (s) localStorage.setItem(FEAT_STORE_KEY, JSON.stringify({ ...s, type: featType }));
-        } catch {}
+    $('feat-tracks').addEventListener('click', e => {
+        const btn = e.target.closest('[data-remove]');
+        if (btn) { hideTooltip(); removeTrack(parseInt(btn.dataset.remove, 10)); }
+    });
+    $('feat-tracks').addEventListener('change', e => {
+        const sel = e.target.closest('select[data-i]');
+        if (!sel) return;
+        const t = tracks[parseInt(sel.dataset.i, 10)];
+        t.type = sel.value;
+        packTrack(t); render();
+        saveTracks();
     });
     window.addEventListener('dragover', e => { if (data && e.dataTransfer?.types.includes('Files')) e.preventDefault(); });
     window.addEventListener('drop', e => {
         if (!data || !e.dataTransfer?.files.length) return;
         e.preventDefault();
-        readFeatureFile(e.dataTransfer.files[0]);
+        readFeatureFiles([...e.dataTransfer.files]);
     });
 
     let resizeTimer;
@@ -1373,18 +1540,22 @@ Features on this contig are drawn under the consensus; the file is remembered fo
         $('viewer').hidden = false;
         filtered = data.reads.filter(r => r.mapq >= minMapq);
         repack();
-        // annotation: from a GenBank reference (sent with the reads), else a file loaded in another contig view
+        // annotation tracks: the GenBank reference's features (sent with the reads),
+        // then the files loaded in this or another contig view
+        tracks = [];
         if (data.annotation?.features?.length) {
-            featFile = data.annotation.name; featAll = data.annotation.features; featOther = []; featType = 'all';
-            updateFeatureUI();
-        } else try {
-            const s = JSON.parse(localStorage.getItem(FEAT_STORE_KEY));
-            if (s?.text) {
-                const res = parseFeatures(s.text, s.name, c.name);
-                featFile = s.name; featAll = res.features; featOther = res.others; featType = s.type || 'all';
-                updateFeatureUI();
+            tracks.push(makeTrack(data.annotation.name, 'reference', { features: data.annotation.features, others: [] }));
+        }
+        try {
+            let stored = JSON.parse(localStorage.getItem(FEAT_STORE_KEY));
+            if (stored && !Array.isArray(stored)) stored = [stored]; // single file, from older versions
+            for (const st of stored || []) {
+                if (!st?.text) continue;
+                tracks.push(makeTrack(st.name, 'file', parseFeatures(st.text, st.name, c.name),
+                    { text: st.text, type: st.type || 'all', remembered: true }));
             }
         } catch {}
+        updateFeatureUI();
         view = { start: 0, end: c.length };
         render();
         scanContig();
