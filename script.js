@@ -781,9 +781,8 @@ async function downloadConsensus(si, btn) {
         const total = sm.contigs.reduce((t, c) => t + c.length, 0) || 1;
         let done = 0;
         for (const c of sm.contigs) {
-            let ref = '';
-            if (referenceFile && c.length <= MAX_SEQ_BP) ref = await readContigSeq(referenceFile, c.name);
-            if (!ref || ref.length !== c.length) { skipped.push(c.name); done += c.length; continue; }
+            const { seq: ref, reason } = await readContigSeq(referenceFile, c.name, c.length);
+            if (!ref) { skipped.push(`${c.name}: ${reason}`); done += c.length; continue; }
             const seq = c.numreads ? await contigConsensus(c, sm.bam, ref, f => {
                 btn.textContent = `Consensus… ${Math.round((done + f * c.length) / total * 100)}%`;
             }) : 'N'.repeat(c.length);
@@ -792,7 +791,7 @@ async function downloadConsensus(si, btn) {
             for (let i = 0; i < seq.length; i += 80) fasta.push(seq.slice(i, i + 80));
         }
         if (fasta.length) downloadBlob(new Blob([fasta.join('\n') + '\n'], { type: 'text/plain' }), `${sm.name.replace(/[^\w.-]+/g, '_')}_consensus.fasta`);
-        if (skipped.length) alert(`No consensus for ${skipped.length} contig(s) (reference sequence not available or longer than ${formatBp(MAX_SEQ_BP)}): ${skipped.slice(0, 5).join(', ')}${skipped.length > 5 ? ', …' : ''}`);
+        if (skipped.length) alert(`No consensus for ${skipped.length} contig(s), reference sequence not usable:\n${skipped.slice(0, 5).join('\n')}${skipped.length > 5 ? '\n…' : ''}`);
     } catch (err) {
         console.error(err);
         alert(`Could not build the consensus: ${err.message || err}`);
@@ -828,35 +827,74 @@ const MIN_GAP_BP = 20;       // deletions/introns at least this long are drawn a
 const MIN_INS_BP = 20;       // insertions at least this long get a marker
 const EXCLUDE_FLAGS = "0x704"; // unmapped, secondary, QC-fail, duplicate
 
-const MAX_SEQ_BP = 30e6;     // longer contigs are shown without mismatches/consensus
+const MAX_SEQ_BP = 300e6;        // longer contigs are shown without mismatches/consensus
+const SEQ_CACHE_MAX_BP = 400e6;  // contig sequences kept for reuse (least recently used dropped first)
 
-// Stream the reference fasta and return one contig's sequence (uppercase), without
-// holding the whole file in memory. Header name = text after '>' up to whitespace.
-async function readContigSeq(file, name) {
-    if (contigSeqCache.has(name)) return contigSeqCache.get(name);
-    const reader = file.stream().pipeThrough(new TextDecoderStream()).getReader();
-    const parts = [];
-    let inTarget = false, done = false, rest = '';
+// One contig's sequence from the reference FASTA, uppercase, as { seq, reason }:
+// seq is '' when it can't be used, with `reason` saying why (shown in the reads view).
+// The file is streamed as bytes straight into a buffer of the contig's length (1 byte
+// per base, no per-line strings), so long chromosomes fit; it stops after the contig.
+// Header name = text after '>' up to the first whitespace, as minimap2/samtools use it.
+async function readContigSeq(file, name, length) {
+    if (!file) return { seq: '', reason: 'no reference file' };
+    if (length > MAX_SEQ_BP) return { seq: '', reason: `contig longer than ${formatBp(MAX_SEQ_BP)}` };
+    if (contigSeqCache.has(name)) { // move to the most recently used end
+        const seq = contigSeqCache.get(name);
+        contigSeqCache.delete(name); contigSeqCache.set(name, seq);
+        return { seq, reason: '' };
+    }
+    const out = new Uint8Array(length);
+    let n = 0, inTarget = false, found = false, done = false;
+    let atLineStart = true, header = null; // header: { parts, len } while reading a '>' line
+    const reader = file.stream().getReader();
     while (!done) {
-        const { value, done: eof } = await reader.read();
-        const text = rest + (value || '');
-        const lines = text.split('\n');
-        rest = eof ? '' : lines.pop();
-        for (const raw of lines) {
-            const line = raw.trimEnd();
-            if (line.startsWith('>')) {
-                if (inTarget) { done = true; break; }
-                inTarget = line.slice(1).split(/\s/)[0] === name;
-            } else if (inTarget) {
-                parts.push(line);
-            }
-        }
+        const { value: buf, done: eof } = await reader.read();
         if (eof) break;
+        let i = 0;
+        while (i < buf.length) {
+            if (header) { // collect the header line (may span chunks)
+                const nl = buf.indexOf(10, i), end = nl === -1 ? buf.length : nl;
+                if (header.len < 4096) { header.parts.push(buf.slice(i, end)); header.len += end - i; }
+                if (nl === -1) break;
+                const bytes = new Uint8Array(header.len);
+                let o = 0;
+                for (const p of header.parts) { bytes.set(p.subarray(0, Math.min(p.length, bytes.length - o)), o); o += p.length; }
+                inTarget = new TextDecoder('latin1').decode(bytes).split(/\s/)[0] === name;
+                if (inTarget) found = true;
+                header = null; atLineStart = true; i = nl + 1;
+                continue;
+            }
+            if (atLineStart && buf[i] === 62) { // '>'
+                if (found) { done = true; break; } // the next record: our contig is complete
+                header = { parts: [], len: 0 }; i++;
+                continue;
+            }
+            const nl = buf.indexOf(10, i), end = nl === -1 ? buf.length : nl;
+            if (inTarget) {
+                for (let k = i; k < end; k++) {
+                    const b = buf[k];
+                    if (b <= 32) continue; // \r, spaces
+                    if (n < length) out[n] = b >= 97 && b <= 122 ? b - 32 : b; // uppercase
+                    n++;
+                }
+            }
+            atLineStart = nl !== -1;
+            i = nl === -1 ? buf.length : nl + 1;
+        }
     }
     reader.cancel().catch(() => {});
-    const seq = parts.join('').toUpperCase();
+    if (!found) return { seq: '', reason: `“${name}” not found in the reference file` };
+    if (n !== length) return { seq: '', reason: `length differs (${n.toLocaleString()} bp in the reference file, ${length.toLocaleString()} bp in the BAM)` };
+    const seq = new TextDecoder('latin1').decode(out);
     contigSeqCache.set(name, seq);
-    return seq;
+    let total = 0;
+    for (const v of contigSeqCache.values()) total += v.length;
+    for (const k of contigSeqCache.keys()) { // drop least recently used, but keep this one
+        if (total <= SEQ_CACHE_MAX_BP || k === name) break;
+        total -= contigSeqCache.get(k).length;
+        contigSeqCache.delete(k);
+    }
+    return { seq, reason: '' };
 }
 
 // Parse one SAM line into a compact read record. Only the first 10 fields are split,
@@ -928,19 +966,15 @@ async function fetchContigReads(contig, bam) {
     args.push(bam, contig.name);
     const sam = await CLI.exec("samtools", args);
 
-    // Reference bases for mismatch calling (skipped for very long contigs)
-    let ref = '';
-    if (referenceFile && contig.length <= MAX_SEQ_BP) {
-        ref = await readContigSeq(referenceFile, contig.name);
-        if (ref.length !== contig.length) ref = ''; // name/length mismatch: don't guess
-    }
+    // Reference bases for mismatch calling; refNote says why when they can't be used
+    const { seq: ref, reason: refNote } = await readContigSeq(referenceFile, contig.name, contig.length);
 
     const reads = [];
     for (const line of sam.split('\n')) {
         const r = parseSamRead(line, ref || null);
         if (r) reads.push(r);
     }
-    return { total, fraction, reads, ref };
+    return { total, fraction, reads, ref, refNote };
 }
 
 // One pending payload per opened tab, delivered when that tab reports it's ready
@@ -979,10 +1013,10 @@ async function sendReadsTo(win, sm, contig, ready) {
     readsViews.set(win, { ready, payload: null });
     let payload;
     try {
-        const { total, fraction, reads, ref } = await fetchContigReads(contig, sm.bam);
+        const { total, fraction, reads, ref, refNote } = await fetchContigReads(contig, sm.bam);
         payload = {
             contig: { name: contig.name, length: contig.length, meandepth: contig.meandepth, coverage: contig.coverage, binSize: contig.binSize },
-            sample: sm.name, profile: contig.profile, total, fraction, reads, ref, limit: MAX_VIEW_READS,
+            sample: sm.name, profile: contig.profile, minProfile: contig.minProfile, total, fraction, reads, ref, refNote, limit: MAX_VIEW_READS,
             annotation: referenceAnnotation?.byContig.has(contig.name)
                 ? { name: referenceAnnotation.name, features: referenceAnnotation.byContig.get(contig.name) } : null
         };

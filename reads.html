@@ -285,6 +285,7 @@ Each file is a track under the consensus; loaded files are remembered for other 
         const n = raw / mag;
         return (n < 1.5 ? 1 : n < 3.5 ? 2 : n < 7.5 ? 5 : 10) * mag;
     }
+    const refWhy = () => data?.refNote || 'reference sequence not loaded';
     const esc = s => String(s).replace(/[<>&"]/g, c => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;', '"': '&quot;' }[c]));
 
     // ---- state ----
@@ -901,7 +902,7 @@ Each file is a track under the consensus; loaded files are remembered for other 
             ctx.textAlign = 'left';
         } else {
             ctx.fillStyle = COL.muted;
-            ctx.fillText(data.ref ? 'consensus: zoom in to see bases' : 'consensus unavailable (reference sequence not loaded)', 6, cy + 3);
+            ctx.fillText(data.ref ? 'consensus: zoom in to see bases' : `consensus unavailable: ${refWhy()}`, 6, cy + 3);
         }
         drawFeatures(ctx, w, COV_H + RULER_H + CONS_H);
         drawGroupMarker(ctx, w, topH);
@@ -1108,7 +1109,7 @@ Each file is a track under the consensus; loaded files are remembered for other 
         const token = ++scanToken;
         variants = []; scanDone = false;
         updateVariantUI();
-        if (!data.ref) { $('var-summary').textContent = 'Variants: unavailable (reference sequence not loaded)'; return; }
+        if (!data.ref) { $('var-summary').textContent = `Variants: unavailable (${refWhy()})`; return; }
         const L = data.contig.length;
         for (let s = 0; s < L; s += SCAN_CHUNK) {
             const c = computeCounts(s, Math.min(L, s + SCAN_CHUNK));
@@ -1376,14 +1377,28 @@ Each file is a track under the consensus; loaded files are remembered for other 
                 (f.info ? `<br>${esc(f.info)}` : '') + '<br><i>click to zoom</i>', e);
         }
         covCanvas.style.cursor = '';
-        if (!counts) return hideTooltip();
+        if (!counts) {
+            // zoomed out: the depth profile bin under the mouse (computed from all reads)
+            const prof = data?.profile || [];
+            if (!prof.length) return hideTooltip();
+            const L = data.contig.length;
+            const bin = data.contig.binSize || Math.max(1, Math.ceil(L / prof.length));
+            const i = Math.floor(bpAtEvent(e, covCanvas) / bin);
+            if (i < 0 || i >= prof.length) return hideTooltip();
+            const lo = data.minProfile?.[i];
+            return showTooltip(
+                `<b>${fmtBp(i * bin + 1)}–${fmtBp(Math.min(L, (i + 1) * bin))}</b><br>` +
+                `mean depth <b>${Math.round(prof[i]).toLocaleString()}</b>` +
+                (lo !== undefined ? ` · lowest <b>${Math.round(lo).toLocaleString()}</b>` : '') +
+                `<br><span style="opacity:.7">all reads · zoom in for per-base counts</span>`, e);
+        }
         const i = Math.floor(bpAtEvent(e, covCanvas)) - counts.s;
         if (i < 0 || i >= counts.depth.length) return hideTooltip();
         const tot = counts.depth[i] + counts.del[i];
         const parts = BASES.map(b => `<span style="color:${baseColor(b)}">${b}</span> ${counts.cnt[b][i]}`).join(' · ');
         showTooltip(
             `<b>${(counts.s + i + 1).toLocaleString()}</b> · ref <b>${counts.ref[i] || '?'}</b> · consensus <b>${counts.cons[i] || '–'}</b><br>` +
-            `depth ${tot} · ${(counts.alt[i] * 100).toFixed(0)}% disagree<br>${parts} · del ${counts.del[i]}` +
+            `depth <b>${tot}</b> · ${(counts.alt[i] * 100).toFixed(0)}% disagree<br>${parts} · del ${counts.del[i]}` +
             (counts.clip[i] ? `<br>${counts.clip[i]} reads soft-clipped here` : ''), e);
     });
     covCanvas.addEventListener('mouseleave', () => { if (!sel?.active) hideTooltip(); });
@@ -1535,7 +1550,7 @@ Each file is a track under the consensus; loaded files are remembered for other 
             (data.fraction < 1
                 ? `<b>${shown.toLocaleString()}</b> of ${data.total.toLocaleString()} reads loaded (limit ${(data.limit || 3000).toLocaleString()})`
                 : `<b>${shown.toLocaleString()}</b> reads`) +
-            (data.ref ? '' : ' · <i>reference sequence not available: mismatches and consensus are off</i>');
+            (data.ref ? '' : ` · <i>reference sequence not available (${esc(refWhy())}): mismatches, consensus and variants are off</i>`);
         status.hidden = true;
         $('viewer').hidden = false;
         filtered = data.reads.filter(r => r.mapq >= minMapq);
