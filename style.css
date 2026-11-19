@@ -351,3 +351,27 @@ h1 {
 .sample-downloads {
     margin: -4px 0 16px;
 }
+
+/* Footer with the repository link */
+.site-footer {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: right;
+    align-items: center;
+    gap: 4px 6px;
+    margin: 40px 0 24px;
+    padding: 12px 16px 0;
+    border-top: 1px solid #e9ecef;
+    line-height: 1.4;
+    font-size: 0.9rem;
+    color: #868e96;
+}
+.site-footer a {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    color: #495057;
+    text-decoration: none;
+}
+.site-footer a:hover { color: #4c9aff; }
+.site-footer svg { display: block; flex: none; }
