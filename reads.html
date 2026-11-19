@@ -140,7 +140,7 @@
                     <option value="10">10 px</option>
                 </select>
             </div>
-            <div class="group" data-tip="Max depth of the pile. Reads that don't fit are hidden from the pile only; depth and consensus still use all loaded reads">
+            <div class="group" data-tip="Max depth of the pile. Reads that don't fit are hidden from the pile only; depth and variants still use all loaded reads">
                 <label for="max-rows">Depth</label>
                 <select id="max-rows">
                     <option value="100">100</option>
@@ -160,7 +160,7 @@
                 </select>
                 <span id="group-note" class="note"></span>
             </div>
-            <div class="group" data-tip="Reads below this MAPQ are hidden and left out of depth, consensus and variants">
+            <div class="group" data-tip="Reads below this MAPQ are hidden and left out of depth and variants">
                 <label for="min-mapq">MAPQ ≥</label>
                 <select id="min-mapq">
                     <option value="0" selected>0</option>
@@ -179,9 +179,11 @@
                 </select>
             </div>
             <label class="group" data-tip="Show soft-clipped read ends"><input type="checkbox" id="show-clips" checked> clips</label>
+            <label class="group" data-tip="Include supplementary alignments (other parts of split reads).
+Unticked, they are hidden and left out of depth and variants."><input type="checkbox" id="show-supp" checked> suppl.</label>
             <div class="sep"></div>
             <div class="group" data-tip="Add BED, GFF3 or GTF annotation files (optionally .gz), or drop them on the page.
-Each file is a track under the consensus; loaded files are remembered for other contig views.">
+Each file is a track under the reference; loaded files are remembered for other contig views.">
                 <button id="feat-btn">Features…</button>
                 <input type="file" id="feat-file" accept=".bed,.gff,.gff3,.gtf,.gz,.txt,.tsv" multiple hidden>
                 <span id="feat-note" class="note"></span>
@@ -214,7 +216,7 @@ Each file is a track under the consensus; loaded files are remembered for other 
                 </label>
                 <button id="dl-var-csv">CSV</button>
                 <button id="dl-var-vcf">VCF</button>
-                <span class="var-note">From the loaded reads: depth ≥ 5 and ≥ 3 reads carrying the allele. Click a row to jump there and group reads by base.</span>
+                <span class="var-note">From the loaded reads: depth ≥ 5 and ≥ 3 reads carrying the allele. Coverage bars are coloured, and reference bases underlined, where at least this fraction of bases differ from the reference. Click a row to jump there and group reads by base.</span>
             </div>
             <div class="var-table-wrap">
                 <table id="var-table">
@@ -235,10 +237,11 @@ Each file is a track under the consensus; loaded files are remembered for other 
 (() => {
     // Keep MIN_GAP_BP / MIN_INS_BP in sync with script.js
     const MIN_GAP_BP = 20, MIN_INS_BP = 20;
-    const DETAIL_SPAN = 20000;   // per-base counts, allele colours and consensus below this span
+    const DETAIL_SPAN = 20000;   // per-base counts and allele colours below this span
     const MM_MAX_BPPX = 10;      // draw read mismatches/small indels when <= this many bp per pixel
-    const ALLELE_FRAC = 0.2;     // highlight a coverage column when >= 20% of reads disagree (as IGV)
-    const COV_H = 90, RULER_H = 22, CONS_H = 24, ROW_GAP = 1, HEADER_H = 18;
+    const ALLELE_FRAC = 0.2;     // lowest allele frequency the variant scan keeps (the cutoff menu filters these)
+    const COV_H = 90, RULER_H = 22, REF_H = 22, ROW_GAP = 1, HEADER_H = 18;
+    const TRACKS_Y = COV_H + RULER_H + REF_H; // annotation tracks start here (top canvas)
     const MIN_CLIP_BP = 20;      // soft clips at least this long count as "clipped" for the pile-up marker
     const MIN_VAR_DEPTH = 5;     // variant table: minimum depth
     const MIN_ALT_READS = 3;     // variant table / clip marker: minimum supporting reads
@@ -297,9 +300,10 @@ Each file is a track under the consensus; loaded files are remembered for other 
     let groupBy = 'none';     // 'none' | 'strand' | 'base'
     let groupPos = null;      // 0-based position used by 'base' grouping
     let minMapq = 0;          // reads below this MAPQ are ignored everywhere
-    let filtered = [];        // loaded reads passing the MAPQ filter
+    let filtered = [];        // loaded reads passing the MAPQ / supplementary filters
     let colorBy = 'strand';   // 'strand' | 'mapq'
     let showClips = true;
+    let showSupp = true;      // include supplementary alignments (pile, depth and variants)
     let minAF = 0.3;          // variant table threshold
     let variants = [];        // all candidates (AF >= ALLELE_FRAC), filtered by minAF for display
     let scanDone = false;     // variant scan finished
@@ -310,7 +314,7 @@ Each file is a track under the consensus; loaded files are remembered for other 
     let maxRows = 250;        // 0 = no limit
     let hiddenReads = 0;      // reads left out of the pile by the depth limit
     let counts = null;        // per-base counts for the detail window (see computeCounts)
-    // Annotation tracks, drawn top to bottom under the consensus:
+    // Annotation tracks, drawn top to bottom under the reference:
     //   { name, source: 'reference' | 'file', text (file tracks, for remembering),
     //     all: features on this contig { start, end, strand, name, type, blocks, thick, color, info },
     //     other: other sequence names in the file, type: type shown ('all'),
@@ -457,7 +461,7 @@ Each file is a track under the consensus; loaded files are remembered for other 
         t.rows = ends.length;
     }
 
-    // Lays the tracks out below the consensus; returns their total height
+    // Lays the tracks out below the reference; returns their total height
     function featTrackH() {
         let y = 0;
         for (const t of tracks) {
@@ -613,7 +617,7 @@ Each file is a track under the consensus; loaded files are remembered for other 
     // Feature under the mouse on the top canvas (null outside the annotation tracks)
     function featureAt(e) {
         const rect = covCanvas.getBoundingClientRect();
-        const yy = e.clientY - rect.top - (COV_H + RULER_H + CONS_H);
+        const yy = e.clientY - rect.top - TRACKS_Y;
         const t = tracks.find(t => yy >= t.y0 && yy < t.y0 + t.h);
         if (!t || yy < t.y0 + FEAT_TOP) return null;
         const row = Math.floor((yy - t.y0 - FEAT_TOP) / FEAT_ROW_H);
@@ -622,7 +626,7 @@ Each file is a track under the consensus; loaded files are remembered for other 
         const f = t.shown.find(f => f.row === row && bp >= f.start - tol && bp <= f.end + tol);
         return f ? { f, track: t } : null;
     }
-    const inFeatureTrack = e => tracks.length && e.clientY - covCanvas.getBoundingClientRect().top >= COV_H + RULER_H + CONS_H;
+    const inFeatureTrack = e => tracks.length && e.clientY - covCanvas.getBoundingClientRect().top >= TRACKS_Y;
 
     function goToFeature(f) {
         const pad = Math.max(20, (f.end - f.start) * 0.1);
@@ -793,7 +797,7 @@ Each file is a track under the consensus; loaded files are remembered for other 
     const xOf = (bp, w) => (bp - view.start) / (view.end - view.start) * w;
 
     function drawTopTracks() {
-        const topH = COV_H + RULER_H + CONS_H + featTrackH();
+        const topH = TRACKS_Y + featTrackH();
         const { ctx, w } = setupCanvas(covCanvas, topH);
         const L = data.contig.length;
         const pxPerBp = w / (view.end - view.start);
@@ -811,7 +815,7 @@ Each file is a track under the consensus; loaded files are remembered for other 
                 const x0 = xOf(counts.s + i, w), x1 = xOf(counts.s + i + 1, w);
                 const bw = Math.max(1, x1 - x0 - (pxPerBp > 4 ? 1 : 0));
                 const h = tot / max * (COV_H - 4);
-                if (counts.alt[i] >= ALLELE_FRAC) {
+                if (counts.alt[i] >= minAF) { // >= cutoff of the bases differ from the reference
                     // stacked bar of A/C/G/T/del proportions
                     let y = COV_H;
                     for (const b of [...BASES, '-']) {
@@ -836,7 +840,7 @@ Each file is a track under the consensus; loaded files are remembered for other 
                 ctx.fillRect(x - 1, 12, 2, COV_H - 12);
             }
             ctx.fillStyle = COL.muted;
-            ctx.fillText(`depth of loaded reads${minMapq ? `, MAPQ ≥ ${minMapq}` : ''} (max ${max})`, 6, 2);
+            ctx.fillText(`depth of loaded reads${filterNote()} (max ${max})`, 6, 2);
         } else {
             // Overview: binned depth profile (computed on all reads, not the subsample)
             const prof = data.profile || [];
@@ -878,33 +882,41 @@ Each file is a track under the consensus; loaded files are remembered for other 
             ctx.fillText(label, Math.min(Math.max(0, x - tw / 2), w - tw), ry + 10);
         }
 
-        // Consensus of the shown reads (letters when zoomed far enough, coloured blocks otherwise).
-        // Bases agreeing with the reference are faded; disagreements are drawn at full strength.
-        const cy = COV_H + RULER_H;
-        if (counts && pxPerBp >= 1) {
-            ctx.font = 'bold 14px ui-monospace, Menlo, monospace';
+        // Reference sequence (letters when zoomed far enough, coloured blocks otherwise).
+        // Where the coverage bar is coloured (>= minAF of the bases differ from the reference), the base
+        // is underlined in the colour of the most common other allele (dark for a deletion).
+        const refY = COV_H + RULER_H;
+        if (data.ref && pxPerBp >= 1) {
+            const ps = Math.max(0, Math.floor(view.start)), pe = Math.min(L, Math.ceil(view.end));
+            ctx.font = 'bold 12px ui-monospace, Menlo, monospace';
             ctx.textAlign = 'center';
-            for (let i = 0; i < counts.cons.length; i++) {
-                const b = counts.cons[i];
-                if (!b) continue;
-                const x0 = xOf(counts.s + i, w), x1 = xOf(counts.s + i + 1, w);
-                const differs = counts.ref[i] && b !== counts.ref[i];
-                ctx.globalAlpha = differs ? 1 : 0.45;
-                ctx.fillStyle = b === '-' ? COL.del : baseColor(b);
-                if (pxPerBp >= 8) {
-                    ctx.fillText(b, (x0 + x1) / 2, cy + 3);
-                    if (differs) ctx.fillRect(x0 + 1, cy + CONS_H - 2, Math.max(1, x1 - x0 - 2), 2);
-                } else {
-                    ctx.fillRect(x0, cy + 4, Math.max(1, x1 - x0), CONS_H - 8);
-                }
+            for (let p = ps; p < pe; p++) {
+                const b = data.ref[p];
+                const x0 = xOf(p, w), x1 = xOf(p + 1, w);
+                ctx.globalAlpha = 0.8;
+                ctx.fillStyle = baseColor(b);
+                if (pxPerBp >= 8) ctx.fillText(b, (x0 + x1) / 2, refY + 3);
+                else ctx.fillRect(x0, refY + 5, Math.max(1, x1 - x0), REF_H - 12);
+                const i = counts ? p - counts.s : -1;
+                if (i < 0 || i >= counts.alt.length || counts.alt[i] < minAF) continue; // same rule as the bars
+                let alt = null, altN = 0; // most common non-reference allele
+                for (const a of BASES) if (a !== b && counts.cnt[a][i] > altN) { alt = a; altN = counts.cnt[a][i]; }
+                if (counts.del[i] > altN) { alt = '-'; altN = counts.del[i]; }
+                if (!alt) continue;
+                ctx.globalAlpha = 1;
+                ctx.fillStyle = alt === '-' ? COL.del : baseColor(alt);
+                const gap = pxPerBp >= 4 ? 1 : 0;
+                ctx.fillRect(x0 + gap, refY + REF_H - 4, Math.max(1, x1 - x0 - 2 * gap), 3);
             }
             ctx.globalAlpha = 1;
             ctx.textAlign = 'left';
         } else {
             ctx.fillStyle = COL.muted;
-            ctx.fillText(data.ref ? 'consensus: zoom in to see bases' : `consensus unavailable: ${refWhy()}`, 6, cy + 3);
+            ctx.font = '10px system-ui, sans-serif';
+            ctx.fillText(data.ref ? 'reference: zoom in to see bases' : `reference unavailable: ${refWhy()}`, 6, refY + 5);
         }
-        drawFeatures(ctx, w, COV_H + RULER_H + CONS_H);
+
+        drawFeatures(ctx, w, TRACKS_Y);
         drawGroupMarker(ctx, w, topH);
         drawSelection(ctx, w, topH);
     }
@@ -1139,7 +1151,7 @@ Each file is a track under the consensus; loaded files are remembered for other 
         const vs = shownVariants();
         const done = scanDone;
         $('var-summary').textContent = done
-            ? `Variants: ${vs.length.toLocaleString()} at allele frequency ≥ ${minAF}${minMapq ? `, MAPQ ≥ ${minMapq}` : ''}`
+            ? `Variants: ${vs.length.toLocaleString()} at allele frequency ≥ ${minAF}${filterNote()}`
             : 'Variants: scanning…';
         for (const id of ['prev-var', 'next-var', 'dl-var-csv', 'dl-var-vcf']) $(id).disabled = !done || !vs.length;
         const rowsHtml = vs.slice(0, MAX_TABLE_ROWS).map(v =>
@@ -1237,8 +1249,12 @@ Each file is a track under the consensus; loaded files are remembered for other 
         return false;
     }
 
+    // Reads used everywhere (pile, depth, variants): MAPQ filter, and supplementary alignments unless hidden
+    const passesFilters = r => r.mapq >= minMapq && (showSupp || !r.supplementary);
+    const filterNote = () => `${minMapq ? `, MAPQ ≥ ${minMapq}` : ''}${showSupp ? '' : ', no supplementary'}`;
+
     function applyMapqFilter() {
-        filtered = data.reads.filter(r => r.mapq >= minMapq);
+        filtered = data.reads.filter(passesFilters);
         repack();
         render();
         scanContig();
@@ -1360,7 +1376,7 @@ Each file is a track under the consensus; loaded files are remembered for other 
     });
     readsCanvas.addEventListener('mouseleave', hideTooltip);
 
-    // Coverage/consensus hover: base counts at that position
+    // Coverage/reference hover: base counts at that position
     covCanvas.addEventListener('mousemove', e => {
         if (sel?.active) return;
         if (data && inFeatureTrack(e)) {
@@ -1397,7 +1413,7 @@ Each file is a track under the consensus; loaded files are remembered for other 
         const tot = counts.depth[i] + counts.del[i];
         const parts = BASES.map(b => `<span style="color:${baseColor(b)}">${b}</span> ${counts.cnt[b][i]}`).join(' · ');
         showTooltip(
-            `<b>${(counts.s + i + 1).toLocaleString()}</b> · ref <b>${counts.ref[i] || '?'}</b> · consensus <b>${counts.cons[i] || '–'}</b><br>` +
+            `<b>${(counts.s + i + 1).toLocaleString()}</b> · ref <b>${counts.ref[i] || '?'}</b><br>` +
             `depth <b>${tot}</b> · ${(counts.alt[i] * 100).toFixed(0)}% disagree<br>${parts} · del ${counts.del[i]}` +
             (counts.clip[i] ? `<br>${counts.clip[i]} reads soft-clipped here` : ''), e);
     });
@@ -1415,7 +1431,8 @@ Each file is a track under the consensus; loaded files are remembered for other 
     $('min-mapq').addEventListener('change', e => { minMapq = parseInt(e.target.value, 10); if (data) applyMapqFilter(); });
     $('color-by').addEventListener('change', e => { colorBy = e.target.value; if (data) render(); });
     $('show-clips').addEventListener('change', e => { showClips = e.target.checked; if (data) render(); });
-    $('min-af').addEventListener('change', e => { minAF = parseFloat(e.target.value); updateVariantUI(); });
+    $('show-supp').addEventListener('change', e => { showSupp = e.target.checked; if (data) applyMapqFilter(); });
+    $('min-af').addEventListener('change', e => { minAF = parseFloat(e.target.value); updateVariantUI(); if (data) render(); });
     $('prev-var').addEventListener('click', () => stepVariant(-1));
     $('next-var').addEventListener('click', () => stepVariant(1));
     $('dl-var-csv').addEventListener('click', variantsCsv);
@@ -1432,7 +1449,7 @@ Each file is a track under the consensus; loaded files are remembered for other 
         input.style.borderColor = ok ? '' : '#b02a37';
     });
 
-    // Drag across the depth plot (coverage, ruler, consensus) to select a region and zoom to it
+    // Drag across the depth plot (coverage, ruler, reference) to select a region and zoom to it
     const clampBp = bp => Math.max(0, Math.min(data.contig.length, bp));
     let justSelected = false;
     covCanvas.addEventListener('mousedown', e => {
@@ -1489,7 +1506,7 @@ Each file is a track under the consensus; loaded files are remembered for other 
         zoomAll();
     });
 
-    // Click on coverage/consensus: group reads by their base at that position
+    // Click on coverage/reference: group reads by their base at that position
     covCanvas.addEventListener('click', e => {
         if (!data || justSelected) return;
         if (inFeatureTrack(e)) { const hit = featureAt(e); if (hit) goToFeature(hit.f); return; }
@@ -1550,10 +1567,10 @@ Each file is a track under the consensus; loaded files are remembered for other 
             (data.fraction < 1
                 ? `<b>${shown.toLocaleString()}</b> of ${data.total.toLocaleString()} reads loaded (limit ${(data.limit || 3000).toLocaleString()})`
                 : `<b>${shown.toLocaleString()}</b> reads`) +
-            (data.ref ? '' : ` · <i>reference sequence not available (${esc(refWhy())}): mismatches, consensus and variants are off</i>`);
+            (data.ref ? '' : ` · <i>reference sequence not available (${esc(refWhy())}): mismatches and variants are off</i>`);
         status.hidden = true;
         $('viewer').hidden = false;
-        filtered = data.reads.filter(r => r.mapq >= minMapq);
+        filtered = data.reads.filter(passesFilters);
         repack();
         // annotation tracks: the GenBank reference's features (sent with the reads),
         // then the files loaded in this or another contig view
