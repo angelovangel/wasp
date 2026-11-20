@@ -27,6 +27,7 @@
         }
         html { font-size: 14px; }
         * { box-sizing: border-box; }
+        [hidden] { display: none !important; } /* else display rules (e.g. .toolbar .group) override it */
         body {
             margin: 0;
             padding: 24px 16px 40px;
@@ -172,6 +173,8 @@
                     <option value="60">60</option>
                 </select>
             </div>
+            <label class="group" id="pairs-box" hidden data-tip="Show the two mates of a read pair in one row, joined by a line.
+Grouping by strand then uses the strand of the first mate (R1)."><input type="checkbox" id="show-pairs" checked> pairs</label>
             <label class="group" data-tip="Show soft-clipped read ends"><input type="checkbox" id="show-clips" checked> clips</label>
             <label class="group" data-tip="Include supplementary alignments (other parts of split reads).
 Unticked, they are hidden and left out of depth and variants."><input type="checkbox" id="show-supp" checked> suppl.</label>
@@ -192,6 +195,7 @@ Each file is a track under the reference; loaded files are remembered for other 
             <span><i class="sw" style="background:repeating-linear-gradient(135deg,var(--fwd) 0 2px,transparent 2px 4px);box-shadow:inset 0 0 0 1px var(--fwd)"></i>supplementary</span>
             <span>mismatch
                 <b class="base" style="color:var(--A)">A</b><b class="base" style="color:var(--C)">C</b><b class="base" style="color:var(--G)">G</b><b class="base" style="color:var(--T)">T</b></span>
+            <span id="pair-legend" hidden><i class="sw" style="height:1px;background:var(--gap)"></i>read pair</span>
             <span><i class="sw" style="height:1px;background:var(--del)"></i>deletion</span>
             <span><i class="sw" style="width:2px;height:8px;background:var(--ins)"></i>insertion</span>
             <span><i class="sw" style="height:3px;background:var(--fwd);opacity:.4"></i>soft clip</span>
@@ -278,6 +282,7 @@ Each file is a track under the reference; loaded files are remembered for other 
     // ---- state ----
     let data = null;          // payload from the main page
     let rows = [];            // rows[i] = reads packed into row i, sorted by start
+    let rowLinks = [];        // rowLinks[i] = read pairs in row i: [left mate, right mate]
     let rowTop = [];          // y (css px) of each row in the reads canvas
     let headers = [];         // group headers: { label, color, n, y }
     let readsHeight = 20;     // total css height of the reads canvas
@@ -291,6 +296,8 @@ Each file is a track under the reference; loaded files are remembered for other 
     let winReq = 0, winLoading = false, winTimer = null, winError = '';
     let readSet = null;       // which reads `filtered` was built from (data.reads or win.reads)
     let showClips = true;
+    let showPairs = true;     // mates of a read pair share a row, joined by a line
+    let hasPairs = false;     // the reads are paired-end
     let showSupp = true;      // include supplementary alignments (pile, depth and variants)
     let minAF = 0.3;          // variant table threshold
     let variants = [];        // all candidates (AF >= ALLELE_FRAC), filtered by minAF for display
@@ -496,25 +503,57 @@ Each file is a track under the reference; loaded files are remembered for other 
     // With a row limit, reads that find no free row are left out (IGV-style downsampling):
     // this trims only where the pile is deeper than the limit. Reads starting at the same
     // position are taken in random order so the choice isn't biased by file order.
+    // With pairs shown, both mates of a pair are packed as one unit spanning them both.
     function pack(reads, length, limit) {
         const pad = Math.max(1, Math.round(length / 2000)); // small horizontal gap between reads
-        const sorted = reads.map(r => [r, Math.random()])
+        const sorted = pairUnits(reads).map(u => [u, Math.random()])
             .sort((a, b) => a[0].start - b[0].start || a[1] - b[1])
             .map(x => x[0]);
         const rowEnds = [];
-        const out = [];
+        const out = [], links = [];
         let hidden = 0;
-        for (const r of sorted) {
-            let i = rowEnds.findIndex(e => e + pad <= r.start);
+        for (const u of sorted) {
+            let i = rowEnds.findIndex(e => e + pad <= u.start);
             if (i === -1) {
-                if (limit && rowEnds.length >= limit) { hidden++; continue; }
-                i = rowEnds.length; rowEnds.push(0); out.push([]);
+                if (limit && rowEnds.length >= limit) { hidden += u.reads.length; continue; }
+                i = rowEnds.length; rowEnds.push(0); out.push([]); links.push([]);
             }
-            rowEnds[i] = r.end;
-            out[i].push(r);
+            rowEnds[i] = u.end;
+            out[i].push(...u.reads);
+            if (u.reads.length === 2) links[i].push(u.reads);
         }
-        return { rows: out, hidden };
+        for (const row of out) row.sort((a, b) => a.start - b.start);
+        return { rows: out, links, hidden };
     }
+
+    // Mates of a pair: paired, primary, both mapped to this contig (both mates must be among `reads`)
+    const isPairedPrimary = r => (r.flag & 0x1) && !(r.flag & 0x808) && r.mateStart >= 0;
+    // Packing units: { start, end, reads: [read] or [left mate, right mate] }
+    function pairUnits(reads) {
+        const units = [], open = new Map();
+        for (const r of reads) {
+            if (showPairs && isPairedPrimary(r)) {
+                const u = open.get(r.name);
+                if (u) {
+                    open.delete(r.name);
+                    u.reads.push(r);
+                    u.reads.sort((a, b) => a.start - b.start);
+                    u.start = Math.min(u.start, r.start); u.end = Math.max(u.end, r.end);
+                    continue;
+                }
+                const nu = { start: r.start, end: r.end, reads: [r] };
+                open.set(r.name, nu);
+                units.push(nu);
+            } else {
+                units.push({ start: r.start, end: r.end, reads: [r] });
+            }
+        }
+        return units;
+    }
+
+    // Strand used for grouping: with pairs shown, the first mate's (R1) strand, so mates stay together
+    const groupStrandRev = r => showPairs && (r.flag & 0x1) && (r.flag & 0x80) && !(r.flag & 0x8)
+        ? (r.flag & 0x20) !== 0 : r.reverse;
 
     // The read's base at reference position p: 'A'/'C'/'G'/'T', '-' (deleted there),
     // or null when the read doesn't cover p (outside it, or in a ref skip).
@@ -542,8 +581,8 @@ Each file is a track under the reference; loaded files are remembered for other 
     function makeGroups() {
         if (groupBy === 'strand') {
             return [
-                { key: 'f', label: 'forward strand', color: COL.fwd, reads: filtered.filter(r => !r.reverse) },
-                { key: 'r', label: 'reverse strand', color: COL.rev, reads: filtered.filter(r => r.reverse) }
+                { key: 'f', label: `forward strand${hasPairs && showPairs ? ' (R1)' : ''}`, color: COL.fwd, reads: filtered.filter(r => !groupStrandRev(r)) },
+                { key: 'r', label: `reverse strand${hasPairs && showPairs ? ' (R1)' : ''}`, color: COL.rev, reads: filtered.filter(r => groupStrandRev(r)) }
             ].filter(g => g.reads.length);
         }
         if (groupBy === 'base' && groupPos !== null) {
@@ -571,14 +610,14 @@ Each file is a track under the reference; loaded files are remembered for other 
         const groups = makeGroups();
         const showHeaders = groupBy !== 'none';
         const pitch = rowH + ROW_GAP;
-        rows = []; rowTop = []; headers = [];
+        rows = []; rowLinks = []; rowTop = []; headers = [];
         hiddenReads = 0;
         let y = 2;
         for (const g of groups) {
             if (showHeaders) { headers.push({ label: g.label, color: g.color, n: g.reads.length, y }); y += HEADER_H; }
             const res = pack(g.reads, readSet === data.reads ? data.contig.length : win.end - win.start, maxRows); // depth limit applies per group
             hiddenReads += res.hidden;
-            for (const row of res.rows) { rows.push(row); rowTop.push(y); y += pitch; }
+            res.rows.forEach((row, i) => { rows.push(row); rowLinks.push(res.links[i]); rowTop.push(y); y += pitch; });
             if (showHeaders) y += 4;
         }
         readsHeight = Math.max(20, y + 2);
@@ -801,6 +840,14 @@ Each file is a track under the reference; loaded files are remembered for other 
 
         rows.forEach((row, ri) => {
             const y = rowTop[ri];
+            // read pairs: a thin line between the mates (none where they overlap)
+            ctx.fillStyle = COL.gap;
+            for (const [a, b] of rowLinks[ri]) {
+                if (b.start <= a.end || a.end > view.end || b.start < view.start) continue;
+                ctx.globalAlpha = Math.min(a.mapq, b.mapq) === 0 ? 0.35 : 1;
+                const x0 = xOf(a.end, w), x1 = xOf(b.start, w);
+                ctx.fillRect(x0, y + Math.floor(rowH / 2), Math.max(1, x1 - x0), 1);
+            }
             for (const r of row) {
                 if (r.end < view.start || r.start > view.end) continue;
                 const baseAlpha = r.mapq === 0 ? 0.35 : 1; // MAPQ 0 reads are faded
@@ -1338,9 +1385,20 @@ Each file is a track under the reference; loaded files are remembered for other 
         showTooltip(
             `<b>${escapeHtml(r.name)}</b><br>` +
             `${(r.start + 1).toLocaleString()}–${r.end.toLocaleString()} (${formatBp(alnLen)})<br>` +
-            `${r.reverse ? 'reverse' : 'forward'} · MAPQ ${r.mapq}${r.supplementary ? ' · supplementary' : ''}${mmRate}`, e);
+            `${r.reverse ? 'reverse' : 'forward'} · MAPQ ${r.mapq}${r.supplementary ? ' · supplementary' : ''}${mmRate}` +
+            (r.flag & 0x1 ? `<br>${pairInfo(r)}` : ''), e);
     });
     readsCanvas.addEventListener('mouseleave', hideTooltip);
+
+    // Tooltip line for a mate of a read pair: which mate, where its mate is, insert size
+    function pairInfo(r) {
+        const which = r.flag & 0x40 ? 'R1' : r.flag & 0x80 ? 'R2' : 'paired';
+        if (r.flag & 0x8) return `${which} · mate unmapped`;
+        const mate = r.mateRef ? `mate on ${escapeHtml(r.mateRef)}`
+            : r.mateStart >= 0 ? `mate at ${(r.mateStart + 1).toLocaleString()} (${r.flag & 0x20 ? 'reverse' : 'forward'})` : 'mate mapped';
+        const insert = !r.mateRef && r.tlen ? ` · insert ${formatBp(Math.abs(r.tlen))}` : '';
+        return `${which} · ${r.flag & 0x2 ? 'proper pair' : 'not a proper pair'} · ${mate}${insert}`;
+    }
 
     // Coverage/reference hover: base counts at that position
     covCanvas.addEventListener('mousemove', e => {
@@ -1395,6 +1453,7 @@ Each file is a track under the reference; loaded files are remembered for other 
         if (data) { repack(); render(); }
     });
     $('min-mapq').addEventListener('change', e => { minMapq = parseInt(e.target.value, 10); if (data) applyMapqFilter(); });
+    $('show-pairs').addEventListener('change', e => { showPairs = e.target.checked; if (data) { repack(); render(); } });
     $('show-clips').addEventListener('change', e => { showClips = e.target.checked; if (data) render(); });
     $('show-supp').addEventListener('change', e => { showSupp = e.target.checked; if (data) applyMapqFilter(); });
     $('min-af').addEventListener('change', e => { minAF = parseFloat(e.target.value); updateVariantUI(); if (data) render(); });
@@ -1526,6 +1585,8 @@ Each file is a track under the reference; loaded files are remembered for other 
         }
         data = payload;
         const c = data.contig;
+        hasPairs = data.reads.some(r => r.flag & 0x1);
+        $('pairs-box').hidden = $('pair-legend').hidden = !hasPairs;
         status.hidden = true;
         $('viewer').hidden = false;
         baseFiltered = data.reads.filter(passesFilters);

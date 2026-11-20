@@ -1235,6 +1235,10 @@ function parseSamRead(line, ref) {
     return {
         name: f[0], start, end: pos, mapq: parseInt(f[4], 10) || 0,
         reverse: (flag & 0x10) !== 0, supplementary: (flag & 0x800) !== 0,
+        // read pairs: flag bits (0x1 paired, 0x2 proper, 0x8 mate unmapped, 0x20 mate reverse,
+        // 0x40/0x80 first/second of pair); mate position on this contig (-1: elsewhere), or its contig
+        flag, mateStart: f[6] === '=' ? parseInt(f[7], 10) - 1 : -1,
+        mateRef: f[6] && f[6] !== '=' && f[6] !== '*' ? f[6] : null, tlen: parseInt(f[8], 10) || 0,
         blocks, dels: Int32Array.from(dels), ins: Int32Array.from(ins),
         mmPos: Int32Array.from(mmPos), mmBase, clipL, clipR
     };
