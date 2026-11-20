@@ -18,6 +18,17 @@ h1 {
     margin-bottom: 15px; 
 } 
 
+/* A file input with files chosen (class set by script.js) */
+.form-control.has-files,
+.form-control.has-files:focus {
+    background-color: #e7f1ff;
+    border-color: #ced4da; /* no blue focus border/glow from Bootstrap after the file dialog closes */
+    box-shadow: none;
+}
+.form-control.has-files::file-selector-button {
+    background-color: #cfe2ff;
+}
+
 /* Form Control - Making it flat */
 .form-control {
     border-radius: 0;

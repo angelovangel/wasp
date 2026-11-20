@@ -1363,3 +1363,11 @@ async function sendReadsTo(win, sm, contig, ready) {
 // Attach event listeners
 document.getElementById("btn").addEventListener("click", run);
 document.getElementById("reset-btn").addEventListener("click", resetPage);
+
+// Colour the file inputs that have files chosen (also after a reload that kept the choice)
+for (const id of ["ref", "query"]) {
+    const el = document.getElementById(id);
+    const mark = () => el.classList.toggle("has-files", el.files.length > 0);
+    el.addEventListener("change", mark);
+    mark();
+}
