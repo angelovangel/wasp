@@ -16,21 +16,24 @@
     <div class="container">
         <h2 class="mb-4 app-title"><img src="favicon.svg" alt="" class="app-logo">wasp <small class="text-muted fs-6 fw-normal">read alignment in the browser</small></h2>
         <div class="row" id="inputs">
-            <div class="col-md-3 file-input">
-                <label for="ref" class="form-label fw-bold">1. Reference (FASTA, GenBank, FASTQ)</label>
-                <input type="file" id="ref" class="form-control" accept=".fasta,.fa,.fna,.fas,.gb,.gbk,.gbff,.genbank,.fastq,.fq,.gz">
+            <div class="col-md-3 file-input" data-tip="FASTA, GenBank, SnapGene .dna or FASTQ, optionally gzipped; can hold several sequences.
+GenBank and SnapGene features are shown in the reads view.
+Optional when only BAM files are given.">
+                <label for="ref" class="form-label fw-bold">1. Reference <span class="help-mark">?</span></label>
+                <input type="file" id="ref" class="form-control" title="" accept=".fasta,.fa,.fna,.fas,.gb,.gbk,.gbff,.genbank,.dna,.fastq,.fq,.gz">
             </div>
 
-            <div class="col-md-4 file-input">
-                <label for="query" class="form-label fw-bold">2. Reads (FASTQ) or alignments (.bam + .bai)</label>
-                <input type="file" id="query" class="form-control" multiple accept=".fastq,.fq,.gz,.bam,.bai,.csi">
+            <div class="col-md-4 file-input" data-tip="FASTQ (optionally gzipped): each file is a separate sample; read pairs (e.g. x_R1.fastq + x_R2.fastq) are aligned together as paired-end in sr mode.
+Coordinate-sorted BAM files (select their .bai index too) skip alignment.">
+                <label for="query" class="form-label fw-bold">2. Reads or alignments <span class="help-mark">?</span></label>
+                <input type="file" id="query" class="form-control" title="" multiple accept=".fastq,.fq,.gz,.bam,.bai,.csi">
             </div>
 
-            <div class="col-md-3 file-input">
-                <label for="sample-value" class="form-label fw-bold">3. Use reads</label>
-                <div class="input-group" title="Reads are sampled at random (fixed seed) while the FASTQ is read.
+            <div class="col-md-3 file-input" data-tip="Reads are sampled at random (fixed seed) while the FASTQ is read.
 Depth: keep enough reads for about this depth on the reference (estimated from the start of each file); all reads if the file has less.
 %: keep this share of the reads (100 = all).">
+                <label for="sample-value" class="form-label fw-bold">3. Use reads <span class="help-mark">?</span></label>
+                <div class="input-group">
                     <input type="number" id="sample-value" class="form-control" value="100" min="0.1" step="any" aria-label="Amount of reads to use">
                     <select id="sample-mode" class="form-select flex-grow-0 w-auto" aria-label="Depth or percent">
                         <option value="depth" selected>x depth</option>
@@ -39,9 +42,9 @@ Depth: keep enough reads for about this depth on the reference (estimated from t
                 </div>
             </div>
 
-            <div class="col-md-2 file-input">
-                <label for="preset" class="form-label fw-bold">4. Preset</label>
-                <select id="preset" class="form-select" title="minimap2 -x preset">
+            <div class="col-md-2 file-input" data-tip="minimap2 -x preset">
+                <label for="preset" class="form-label fw-bold">4. Preset <span class="help-mark">?</span></label>
+                <select id="preset" class="form-select">
                     <option value="map-ont" selected>map-ont (Nanopore)</option>
                     <option value="map-hifi">map-hifi (PacBio HiFi)</option>
                     <option value="map-pb">map-pb (PacBio CLR)</option>
@@ -64,10 +67,7 @@ Depth: keep enough reads for about this depth on the reference (estimated from t
         
         <div id="output">
             <p id="initial-message" class="text-muted">
-                Choose your files and click 'Run Analysis', <b>no data leaves the browser.</b><br>
-                The reference can have multiple entries (FASTA, GenBank or FASTQ, optionally gzipped).
-                Existing coordinate-sorted BAM files (select their .bai index too) skip alignment; the reference is then optional. <br>
-                Each FASTQ file is a separate sample; read pairs (e.g. x_R1.fastq + x_R2.fastq) are aligned together as paired-end in sr mode.
+                Choose your files and click 'Run', <b>no data leaves the browser.</b> Hover over an input for the file formats it takes.
             </p>
         </div>
         

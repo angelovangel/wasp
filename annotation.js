@@ -98,6 +98,64 @@ function parseGenbank(text) {
     return { fasta: out.length ? out.join('\n') + '\n' : '', annotation };
 }
 
+// ---- SnapGene .dna (binary) ----
+// The file is a series of packets: 1 byte type, 4 bytes big-endian length, data.
+//   0x09: header, starts with 'SnapGene'
+//   0x00: DNA: 1 flags byte (bit 0 = circular), then the sequence as ASCII
+//   0x0A: features, XML: <Feature name type directionality(1 fwd, 2 rev)><Segment range="a-b"/>
+//         <Q name="..."><V text="..."/></Q></Feature> (ranges 1-based inclusive; a > b wraps the origin)
+function isSnapGene(bytes) {
+    return bytes.length >= 13 && bytes[0] === 0x09 && new TextDecoder().decode(bytes.subarray(5, 13)) === 'SnapGene';
+}
+
+// bytes: Uint8Array of the whole file; name: the record (contig) name.
+// Returns { fasta, annotation: Map name -> features }, as parseGenbank.
+function parseSnapGene(bytes, name) {
+    if (!isSnapGene(bytes)) throw new Error('not a SnapGene .dna file');
+    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    const dec = new TextDecoder();
+    let seq = '', featXml = null;
+    for (let p = 0; p + 5 <= bytes.length;) {
+        const type = bytes[p], len = view.getUint32(p + 1);
+        const data = bytes.subarray(p + 5, p + 5 + len);
+        if (type === 0x00 && !seq) seq = dec.decode(data.subarray(1)).replace(/[^A-Za-z]/g, '').toUpperCase();
+        else if (type === 0x0A) featXml = dec.decode(data);
+        p += 5 + len;
+    }
+    const annotation = new Map();
+    if (!seq) return { fasta: '', annotation };
+    const L = seq.length;
+    if (featXml) {
+        const doc = new DOMParser().parseFromString(featXml, 'application/xml');
+        const feats = [];
+        for (const f of doc.querySelectorAll('Feature')) {
+            const type = f.getAttribute('type') || 'misc_feature';
+            if (type === 'source') continue;
+            const q = {};
+            for (const qe of f.querySelectorAll(':scope > Q')) {
+                const v = qe.querySelector('V');
+                const val = v && (v.getAttribute('text') ?? v.getAttribute('int') ?? v.getAttribute('predef'));
+                // texts can carry HTML markup (<html><body>...): keep the plain text
+                if (val != null) q[qe.getAttribute('name')] = val.replace(/<[^>]*>/g, '').trim();
+            }
+            if (f.getAttribute('name')) q.label = f.getAttribute('name');
+            // segments as a GenBank location, so the same code handles strands, joins and the origin
+            const segs = [...f.querySelectorAll(':scope > Segment')].flatMap(s => {
+                const m = (s.getAttribute('range') || '').match(/^(\d+)-(\d+)$/);
+                if (!m) return [];
+                const a = +m[1], b = +m[2];
+                return a <= b ? [`${a}..${b}`] : [`${a}..${L}`, `1..${b}`]; // wraps the origin
+            });
+            if (!segs.length) continue;
+            let loc = segs.length > 1 ? `join(${segs.join(',')})` : segs[0];
+            if (f.getAttribute('directionality') === '2') loc = `complement(${loc})`;
+            feats.push(...genbankFeature(type, loc, q, L));
+        }
+        if (feats.length) annotation.set(name, feats);
+    }
+    return { fasta: `>${name}\n${wrap80(seq)}\n`, annotation };
+}
+
 // ---- BED / GFF3 / GTF ----
 function gffAttrs(s) {
     const a = {};

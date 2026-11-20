@@ -257,7 +257,7 @@ function stopProgress() {
 }
 
 // Sample name from a fastq file name: strip .fastq/.fq(.gz)
-// --- REFERENCE: FASTA is used as is; GenBank, FASTQ and gzipped files are converted to FASTA ---
+// --- REFERENCE: FASTA is used as is; GenBank, SnapGene .dna, FASTQ and gzipped files are converted to FASTA ---
 // wrap80, parseGenbank: annotation.js (shared with the reads view)
 
 // FASTQ (4 lines per record): keep the header and sequence, drop the qualities
@@ -278,10 +278,16 @@ async function referenceAsFasta(file) {
     // so large gzipped FASTA files work; only GenBank/FASTQ, which are converted, are read as text
     const src = gz ? await new Response(file.stream().pipeThrough(gunzipStream())).blob() : file;
     // detect the format from the first non-blank line
-    const first = (await src.slice(0, 65536).text()).trimStart();
+    const head = new Uint8Array(await src.slice(0, 65536).arrayBuffer());
+    const first = new TextDecoder().decode(head).trimStart();
     const base = file.name.replace(/\.gz$/i, '').replace(/\.[^.]+$/, '') || 'reference';
     let fasta, annotation = null;
-    if (first[0] === '>') {
+    if (isSnapGene(head)) { // binary SnapGene .dna: one record, named after the file
+        const sg = parseSnapGene(new Uint8Array(await src.arrayBuffer()), base.replace(/\s+/g, '_'));
+        if (!sg.fasta) throw new Error('no DNA sequence found in the SnapGene file');
+        fasta = sg.fasta;
+        annotation = sg.annotation.size ? { name: file.name, byContig: sg.annotation } : null;
+    } else if (first[0] === '>') {
         if (!gz) return { file, annotation: null }; // plain FASTA: use the file directly
         return { file: new File([src], `${base}.fasta`, { type: 'text/plain' }), annotation: null };
     } else if (first.startsWith('LOCUS')) {
@@ -292,7 +298,7 @@ async function referenceAsFasta(file) {
     } else if (first[0] === '@') {
         fasta = fastqToFasta(await src.text());
     } else {
-        throw new Error(`could not recognise the reference format of ${file.name} (expected FASTA, GenBank or FASTQ)`);
+        throw new Error(`could not recognise the reference format of ${file.name} (expected FASTA, GenBank, SnapGene or FASTQ)`);
     }
     return { file: new File([fasta], `${base}.fasta`, { type: 'text/plain' }), annotation };
 }
@@ -899,7 +905,7 @@ function showSample(si) {
 // --- INSTANT TOOLTIPS for the results table (native title tooltips appear only after ~1 s) ---
 const tipEl = Object.assign(document.createElement('div'), { className: 'quick-tip' });
 document.body.appendChild(tipEl);
-attachQuickTips([document.getElementById("results")], tipEl);
+attachQuickTips([document.getElementById("results"), document.getElementById("inputs")], tipEl);
 
 // --- CONTIG WARNINGS ---
 const WARN_MIN_COVERAGE = 90; // % of bases covered

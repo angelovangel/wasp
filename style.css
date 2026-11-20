@@ -388,3 +388,20 @@ h1 {
 /* App name with its icon */
 .app-title { display: flex; align-items: center; flex-wrap: wrap; gap: 4px 8px; }
 .app-logo { width: 0.9em; height: 0.9em; flex: none; }
+
+/* Hint that an input has a hover tooltip (data-tip on its column) */
+.help-mark {
+    display: inline-block;
+    width: 1.1em;
+    height: 1.1em;
+    margin-left: 2px;
+    font-size: 0.7rem;
+    font-weight: 700;
+    line-height: 1.1em;
+    text-align: center;
+    vertical-align: middle;
+    color: #6c757d;
+    border: 1px solid #adb5bd;
+    border-radius: 50%;
+    cursor: help;
+}
