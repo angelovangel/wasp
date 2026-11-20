@@ -375,3 +375,12 @@ h1 {
 }
 .site-footer a:hover { color: #4c9aff; }
 .site-footer svg { display: block; flex: none; }
+
+/* Progress of a per-sample task (e.g. consensus FASTA) under the download buttons */
+.task-progress { margin: 0 0 12px; }
+.task-progress .tp-cancel { font-size: inherit; vertical-align: baseline; }
+
+/* Contig list: name filter (shown with more than 100 contigs) and the "showing N of M" note */
+.contig-filter { max-width: 420px; margin: 0 0 8px; }
+.list-note { font-size: 0.85rem; margin: 6px 0 0; }
+.list-note:empty { display: none; }

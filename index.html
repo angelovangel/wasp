@@ -15,21 +15,26 @@
     <div class="container">
         <h2 class="mb-4">wasp <small class="text-muted fs-6 fw-normal">read alignment in the browser</small></h2>
         <div class="row" id="inputs">
-            <div class="col-md-4 file-input">
+            <div class="col-md-3 file-input">
                 <label for="ref" class="form-label fw-bold">1. Reference (FASTA, GenBank, FASTQ)</label>
                 <input type="file" id="ref" class="form-control" accept=".fasta,.fa,.fna,.fas,.gb,.gbk,.gbff,.genbank,.fastq,.fq,.gz">
             </div>
 
             <div class="col-md-4 file-input">
-                <label for="query" class="form-label fw-bold">2. Query Reads (.fastq/.fq)</label>
-                <input type="file" id="query" class="form-control" multiple accept=".fastq,.gz">
+                <label for="query" class="form-label fw-bold">2. Reads (FASTQ) or alignments (BAM + .bai)</label>
+                <input type="file" id="query" class="form-control" multiple accept=".fastq,.fq,.gz,.bam,.bai,.csi">
             </div>
 
-            <div class="col-md-2 file-input">
-                <label for="subsample" class="form-label fw-bold">3. Use reads</label>
-                <div class="input-group" title="Randomly subsample each fastq (seqtk, fixed seed). 100% = use all reads.">
-                    <input type="number" id="subsample" class="form-control" value="100" min="0.1" max="100" step="any">
-                    <span class="input-group-text">%</span>
+            <div class="col-md-3 file-input">
+                <label for="sample-value" class="form-label fw-bold">3. Use reads</label>
+                <div class="input-group" title="Reads are sampled at random (fixed seed) while the FASTQ is read.
+Depth: keep enough reads for about this depth on the reference (estimated from the start of each file); all reads if the file has less.
+%: keep this share of the reads (100 = all).">
+                    <input type="number" id="sample-value" class="form-control" value="100" min="0.1" step="any" aria-label="Amount of reads to use">
+                    <select id="sample-mode" class="form-select flex-grow-0 w-auto" aria-label="Depth or percent">
+                        <option value="depth" selected>x depth</option>
+                        <option value="pct">%</option>
+                    </select>
                 </div>
             </div>
 
@@ -59,8 +64,9 @@
         <div id="output">
             <p id="initial-message" class="text-muted">
                 Choose your files and click 'Run Analysis', <b>no data leaves the browser.</b><br>
-                The reference can have multiple entries (FASTA, GenBank or FASTQ, optionally gzipped). <br>
-                Each selected fastq file is treated as a separate sample.
+                The reference can have multiple entries (FASTA, GenBank or FASTQ, optionally gzipped).
+                Existing coordinate-sorted BAM files (select their .bai index too) skip alignment; the reference is then optional. <br>
+                Each FASTQ file is a separate sample; R1/R2 pairs (e.g. <i>x_R1.fastq.gz</i> + <i>x_R2.fastq.gz</i>) are aligned together as paired-end.
             </p>
         </div>
         
@@ -80,6 +86,9 @@
     <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
     
     <script src="https://biowasm.com/cdn/v3/aioli.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/pako/2.1.0/pako_inflate.min.js"></script>
+    <script src="common.js"></script>
+    <script src="annotation.js"></script>
     <script type="module" src="script.js"></script>
 </body>
 </html>
