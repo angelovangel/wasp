@@ -384,3 +384,7 @@ h1 {
 .contig-filter { max-width: 420px; margin: 0 0 8px; }
 .list-note { font-size: 0.85rem; margin: 6px 0 0; }
 .list-note:empty { display: none; }
+
+/* App name with its icon */
+.app-title { display: flex; align-items: center; flex-wrap: wrap; gap: 4px 8px; }
+.app-logo { width: 0.9em; height: 0.9em; flex: none; }

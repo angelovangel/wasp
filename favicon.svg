@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <!-- wasp: amber hexagon (nest cell) with staggered read bars (wasp stripes / alignment pile) and one mismatch -->
+  <path d="M32 3 57 17.5v29L32 61 7 46.5v-29z" fill="#f5b301"/>
+  <rect x="14" y="20" width="30" height="6" rx="3" fill="#212529"/>
+  <rect x="20" y="29" width="30" height="6" rx="3" fill="#212529"/>
+  <rect x="12" y="38" width="26" height="6" rx="3" fill="#212529"/>
+  <rect x="30" y="38" width="4" height="6" fill="#d62728"/>
+</svg>

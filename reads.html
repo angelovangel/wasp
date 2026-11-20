@@ -4,6 +4,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>Mapped reads · wasp</title>
+    <link rel="icon" href="favicon.svg" type="image/svg+xml">
     <style>
         :root {
             --bg: #f8f9fa;
@@ -39,6 +40,7 @@
         /* Contig name and its summary on one line (wraps on narrow screens) */
         .title-line { display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 14px; margin-bottom: 12px; }
         h1 { font-size: 1.4rem; font-weight: 500; margin: 0; word-break: break-all; }
+        .app-logo { width: 1.25rem; height: 1.25rem; flex: none; align-self: center; margin-right: -6px; } /* sits next to the contig name */
         .meta { color: var(--muted); }
         .meta b { color: var(--text); font-weight: 600; }
 
@@ -112,6 +114,7 @@
 <body>
 <div class="wrap">
     <div class="title-line">
+        <img src="favicon.svg" alt="" class="app-logo">
         <h1 id="title">Mapped reads</h1>
         <div class="meta" id="meta"></div>
     </div>
