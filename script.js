@@ -1371,3 +1371,30 @@ for (const id of ["ref", "query"]) {
     el.addEventListener("change", mark);
     mark();
 }
+
+// --- DEMO DATA: fetch the files in demo/ and put them in the inputs, as if chosen by hand ---
+const DEMO = { ref: ["plasmids.gbk"], query: ["sample22.fastq.gz", "sample23.fastq.gz"] };
+document.getElementById("demo-btn").addEventListener("click", async (e) => {
+    const btn = e.currentTarget, label = btn.textContent;
+    btn.disabled = true;
+    btn.textContent = "Loading…";
+    try {
+        for (const [id, names] of Object.entries(DEMO)) {
+            const dt = new DataTransfer();
+            for (const name of names) {
+                const res = await fetch(`demo/${name}`);
+                if (!res.ok) throw new Error(`demo/${name}: ${res.status} ${res.statusText}`);
+                dt.items.add(new File([await res.blob()], name));
+            }
+            const el = document.getElementById(id);
+            el.files = dt.files;
+            el.dispatchEvent(new Event("change"));
+        }
+        document.getElementById("preset").value = "map-ont";
+        btn.textContent = "Demo data loaded";
+    } catch (err) {
+        btn.disabled = false;
+        btn.textContent = label;
+        alert(`Could not load the demo data (${err.message}). The page must be served over http(s), not opened as a file.`);
+    }
+});
