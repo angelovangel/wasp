@@ -3,6 +3,35 @@ const CLI = await new Aioli([
     "minimap2/2.22"
 ], {debug: true});
 
+// --- PARALLEL ALIGNMENT: extra Aioli instances (each its own Web Worker, so its own core) align
+// read batches alongside CLI. Each holds a copy of the minimap2 index and one batch (~0.5-1 GB at
+// most), so their number is capped by cores, and by device memory when the browser reports it.
+const MAX_ALIGNERS = 8;          // workers aligning at once, CLI included
+const GB_PER_ALIGNER = 1;        // device memory set aside per worker
+const PARALLEL_BATCH_BASES = 50e6; // largest batch when several workers align at once…
+const MIN_BATCH_BASES = 5e6;       // …and the smallest (each batch re-loads the index)
+const extraAligners = [];        // created on first use and kept for later runs
+function alignerCount() {
+    const cores = navigator.hardwareConcurrency || 2;
+    // Chrome only, rounded and capped at 8 (absent on plain http): a missing value doesn't limit
+    const memGB = navigator.deviceMemory || 8;
+    return Math.max(1, Math.min(MAX_ALIGNERS, cores - 1, Math.floor(memGB / GB_PER_ALIGNER)));
+}
+// CLI plus enough extra workers to make `n`; the minimap2 index `mmi` (a path in CLI's file
+// system) is copied into each extra one.
+async function getAligners(n, mmi) {
+    while (extraAligners.length < n - 1) extraAligners.push(await new Aioli(["samtools/1.21", "minimap2/2.22"]));
+    const pool = [CLI, ...extraAligners.slice(0, n - 1)];
+    if (pool.length > 1) {
+        const bytes = await CLI.fs.readFile(mmi);
+        for (const a of pool.slice(1)) await a.fs.writeFile(mmi, bytes);
+    }
+    return pool;
+}
+async function releaseAligners(pool, mmi) {
+    for (const a of pool.slice(1)) { try { await a.fs.unlink(mmi); } catch {} }
+}
+
 const NBINS = 300; // number of windows in each contig's depth profile
 const DEPTH_CHUNK_BP = 2e6; // samtools depth covers at most this many bases per call, so its output stays far below browser string limits
 const DEPTH_LONG_BP = 1e6;  // contigs at least this long are read region by region
@@ -228,7 +257,7 @@ function showProgress(outputDiv) {
     outputDiv.innerHTML = `
         <div class="run-progress">
             <div class="run-progress-text">
-                <span id="progress-label">Starting…</span>
+                <span id="progress-label" style="white-space: pre-line">Starting…</span>
                 <span id="progress-elapsed">0s</span>
             </div>
             <div class="run-progress-track" role="progressbar" aria-label="Analysis progress" aria-valuemin="0" aria-valuemax="100">
@@ -467,7 +496,7 @@ async function sampleFastqBatches(files, p, batchBases, onBatch, onProgress = ()
 // refBp: total reference length (for the target depth). `progress(frac, label)`: 0..1.
 // The reads stream through sampleFastqBatches; each batch is aligned (minimap2) and sorted into
 // its own small BAM, and the batch BAMs are merged at the end, so no full-size SAM ever exists.
-async function runSample({ name, files, target, preset, sampling, refBp, batchBases, index }, progress) {
+async function runSample({ name, files, target, preset, sampling, refBp, batchBases, index, aligners = [CLI] }, progress) {
     const tag = `s${index}`;
     let bam = `${tag}.sorted.bam`;
     const paired = files.length === 2;
@@ -484,31 +513,74 @@ async function runSample({ name, files, target, preset, sampling, refBp, batchBa
     }
     const keepNote = p >= 1 ? 'all reads' : `${(p * 100).toFixed(p < 0.1 ? 2 : 1)}% of reads`;
 
-    const batchBams = [];
-    let readPct = 0;
-    const stats = await sampleFastqBatches(files, p, batchBases, async (data, bases) => {
-        const k = batchBams.length;
-        progress(0.02 + 0.73 * readPct, `Aligning batch ${k + 1} (${formatBp(bases)}) with minimap2…`);
+    // Several workers: batches small enough that each worker gets about two of them
+    if (aligners.length > 1) {
+        if (estBases === null) {
+            progress(0, 'Estimating how much sequence the reads contain…');
+            estBases = 0;
+            for (const f of files) estBases += await estimateFastqBases(f);
+        }
+        const kept = p * estBases;
+        if (kept > 0) batchBases = Math.max(MIN_BATCH_BASES, Math.min(batchBases, Math.ceil(kept / (2 * aligners.length))));
+    }
+
+    // Align + sort one batch on worker `a`; the batch BAM ends up in CLI's file system.
+    const alignBatch = async (a, k, data) => {
         const fq = data.map((_, j) => `${tag}.b${k}_${j + 1}.fastq`);
-        for (const [j, d] of data.entries()) await CLI.fs.writeFile(fq[j], d);
+        for (const [j, d] of data.entries()) await a.fs.writeFile(fq[j], d);
         const sam = `${tag}.b${k}.sam`, out = `${tag}.b${k}.bam`;
-        await CLI.exec("minimap2", [
+        await a.exec("minimap2", [
             "-a",
             "-K", "50M", // smaller query batches -> lower peak memory (default 500M)
             "-x", preset,
             ...(paired ? ["--frag=yes"] : []), // two files: mates of read pairs, aligned as fragments
             "-o", sam, target, ...fq
         ]);
-        for (const f of fq) await CLI.fs.unlink(f);
+        for (const f of fq) await a.fs.unlink(f);
         // -m caps the sort buffer so samtools spills to temp files
-        await CLI.exec("samtools", ["sort", "-m", "200M", "-o", out, sam]);
-        await CLI.fs.unlink(sam);
-        batchBams.push(out);
-    }, (frac, st) => {
-        readPct = frac;
-        progress(0.02 + 0.73 * frac, `Reading and sampling ${paired ? 'read pairs' : 'reads'} (${keepNote}): ` +
-            `${Math.round(frac * 100)}% of the file · ${st.kept.toLocaleString()} kept · batch ${batchBams.length + 1}`);
-    });
+        await a.exec("samtools", ["sort", "-m", "200M", "-o", out, sam]);
+        await a.fs.unlink(sam);
+        if (a !== CLI) { // move the BAM over to CLI, where it is merged and analysed
+            await CLI.fs.writeFile(out, await a.fs.readFile(out));
+            await a.fs.unlink(out);
+        }
+        return out;
+    };
+
+    // Batches go to whichever worker is free; reading the FASTQ waits only when all are busy.
+    const free = [...aligners], waiting = [], running = new Set();
+    const batchBams = [];
+    let failure = null, nBatches = 0, nDone = 0;
+    const takeWorker = () => free.length ? Promise.resolve(free.pop()) : new Promise(res => waiting.push(res));
+    const giveBack = a => { const w = waiting.shift(); if (w) w(a); else free.push(a); };
+    const busyNote = () => aligners.length > 1 ? ` · aligning on ${running.size}/${aligners.length} workers` : '';
+    const batchNote = () => `\n${nDone}/${nBatches} batches aligned${busyNote()}`; // second line of the label
+
+    let readPct = 0, stats;
+    try {
+        stats = await sampleFastqBatches(files, p, batchBases, async (data, bases) => {
+            if (failure) throw failure;
+            const a = await takeWorker();
+            if (failure) throw failure;
+            const k = nBatches++;
+            progress(0.02 + 0.73 * readPct, `Aligning batch ${k + 1} (${formatBp(bases)}) with minimap2…${batchNote()}`);
+            const job = alignBatch(a, k, data)
+                .then(out => { batchBams[k] = out; nDone++; })
+                .catch(err => { failure ||= err; })
+                .finally(() => { running.delete(job); giveBack(a); });
+            running.add(job);
+        }, (frac, st) => {
+            readPct = frac;
+            progress(0.02 + 0.73 * frac, `Reading and sampling ${paired ? 'read pairs' : 'reads'} (${keepNote}): ` +
+                `${Math.round(frac * 100)}% of the file · ${st.kept.toLocaleString()} kept${batchNote()}`);
+        });
+    } catch (err) {
+        await Promise.allSettled(running); // let the workers finish before the error is reported
+        throw err;
+    }
+    if (running.size) progress(0.75, `Finishing alignment of the last ${running.size} batch${running.size > 1 ? 'es' : ''}…`);
+    await Promise.all(running);
+    if (failure) throw failure;
     if (!batchBams.length) throw new Error(`${name}: no reads ${stats.reads ? 'were sampled (try a higher target)' : 'found in the FASTQ file'}`);
 
     if (batchBams.length === 1) {
@@ -696,12 +768,19 @@ async function run() {
 
         // Reads are aligned in batches: build the minimap2 index once and reuse it for all of them.
         // Big references skip the .mmi copy (memory) and are re-indexed per batch, so their batches are bigger.
-        let target = refPath, batchBases = BATCH_BASES, refBp = 0;
+        // With an index, batches are aligned on several workers at once (see getAligners).
+        let target = refPath, batchBases = BATCH_BASES, refBp = 0, aligners = [CLI];
         if (fastqs.length) {
             if (refFile.size <= MMI_MAX_REF_BYTES) {
                 setProgress(4, "Indexing reference…");
                 await CLI.exec("minimap2", ["-x", preset, "-d", "ref.mmi", refPath]);
                 target = "ref.mmi";
+                const n = alignerCount();
+                if (n > 1) {
+                    setProgress(4, `Starting ${n} alignment workers…`);
+                    aligners = await getAligners(n, target);
+                    batchBases = PARALLEL_BATCH_BASES;
+                }
             } else {
                 batchBases = BATCH_BASES_NO_MMI;
             }
@@ -716,12 +795,15 @@ async function run() {
             };
             const sample = job.kind === 'bam'
                 ? await bamSample(job, report)
-                : await runSample({ ...job, target, preset, sampling, refBp, batchBases }, report);
+                : await runSample({ ...job, target, preset, sampling, refBp, batchBases, aligners }, report);
             sample.fromBam = job.kind === 'bam';
             sample.paired = !!job.paired;
             samples.push(sample);
         }
-        if (target === "ref.mmi") await CLI.fs.unlink("ref.mmi");
+        if (target === "ref.mmi") {
+            await releaseAligners(aligners, target);
+            await CLI.fs.unlink("ref.mmi");
+        }
 
         if (samples.every(sm => sm.contigs.length === 0)) {
             outputDiv.innerHTML = '<div class="alert alert-warning" role="alert">Analysis completed, but no coverage data was generated. Check your input files.</div>';
@@ -1250,10 +1332,15 @@ function parseSamRead(line, ref) {
     };
 }
 
-// Reads of a contig, or of a region of it ("name:start-end"), randomly subsampled to `limit`
-async function fetchContigReads(contig, bam, region = regionOf(contig.name), limit = MAX_VIEW_READS) {
-    const countOut = await CLI.exec("samtools", ["view", "-c", "-F", EXCLUDE_FLAGS, bam, region]);
-    const total = parseInt(countOut.trim().split('\n').pop(), 10) || 0;
+async function countReads(bam, region) {
+    const out = await CLI.exec("samtools", ["view", "-c", "-F", EXCLUDE_FLAGS, bam, region]);
+    return parseInt(out.trim().split('\n').pop(), 10) || 0;
+}
+
+// Reads of a contig, or of a region of it ("name:start-end"), randomly subsampled to `limit`.
+// `total`: the region's read count, if already known.
+async function fetchContigReads(contig, bam, region = regionOf(contig.name), limit = MAX_VIEW_READS, total = null) {
+    if (total === null) total = await countReads(bam, region);
 
     const args = ["view", "-F", EXCLUDE_FLAGS];
     let fraction = 1;
@@ -1278,18 +1365,43 @@ async function fetchContigReads(contig, bam, region = regionOf(contig.name), lim
 
 // --- READS FOR A WINDOW: the reads view asks for all reads around what it shows when zoomed in ---
 const MAX_WINDOW_READS = 20000;
-const windowJobs = new Map(); // reads tab -> { busy, next }: one fetch at a time per tab, latest request wins
+// Per reads tab and request kind, one fetch at a time; the latest request wins.
+//   reads-window: reads around the zoomed-in view, subsampled to MAX_WINDOW_READS
+//   reads-scan:   one chunk of the variant scan, all reads (the tab asks for the next chunk when done)
+// Variant-scan chunks hold at most about this many aligned bases (SAM text is ~2-3 bytes per base,
+// so this keeps each chunk's samtools output well under browser string limits).
+const SCAN_MAX_BASES = 30e6;
+const SCAN_MIN_BP = 500;
+
+// Shrink [start, end) until its reads carry about SCAN_MAX_BASES at most, estimated from the read
+// count and the contig's mean aligned read length. Returns the (possibly smaller) end and the count.
+async function sizeScanChunk(contig, bam, start, end) {
+    const meanLen = Math.max(100, (parseFloat(contig.meandepth) || 0) * contig.length / Math.max(1, contig.numreads || 0)) || 1000;
+    for (;;) {
+        const total = await countReads(bam, regionOf(contig.name, start, end));
+        const span = end - start;
+        if (total * meanLen <= SCAN_MAX_BASES || span <= SCAN_MIN_BP) return { end, total };
+        end = start + Math.max(SCAN_MIN_BP, Math.floor(span * SCAN_MAX_BASES / (total * meanLen) * 0.8));
+    }
+}
+
+const READ_REQUESTS = { 'reads-window': MAX_WINDOW_READS, 'reads-scan': Infinity };
+const windowJobs = new Map(); // `${kind}` -> Map(tab -> { busy, next })
 
 window.addEventListener('message', (e) => {
-    if (e.origin !== window.location.origin || e.data?.type !== 'reads-window') return;
-    const job = windowJobs.get(e.source) || { busy: false, next: null };
-    windowJobs.set(e.source, job);
+    const kind = e.data?.type;
+    if (e.origin !== window.location.origin || !(kind in READ_REQUESTS)) return;
+    if (!windowJobs.has(kind)) windowJobs.set(kind, new Map());
+    const jobs = windowJobs.get(kind);
+    const job = jobs.get(e.source) || { busy: false, next: null };
+    jobs.set(e.source, job);
     job.next = e.data;
-    if (!job.busy) runWindowJobs(e.source, job);
+    if (!job.busy) runWindowJobs(e.source, job, kind);
 });
 
-async function runWindowJobs(win, job) {
+async function runWindowJobs(win, job, kind) {
     job.busy = true;
+    const type = `${kind}-data`;
     while (job.next) {
         const m = job.next;
         job.next = null;
@@ -1298,11 +1410,13 @@ async function runWindowJobs(win, job) {
             const sm = samples.find(x => x.name === m.sample) || (samples.length === 1 ? samples[0] : null);
             const contig = sm?.contigs.find(c => c.name === m.contig);
             if (!contig) throw new Error('contig not found');
-            const start = Math.max(0, Math.floor(m.start)), end = Math.min(contig.length, Math.ceil(m.end));
-            const { total, fraction, reads } = await fetchContigReads(contig, sm.bam, regionOf(contig.name, start, end), MAX_WINDOW_READS);
-            reply = { type: 'reads-window-data', id: m.id, start, end, total, fraction, reads };
+            const start = Math.max(0, Math.floor(m.start));
+            let end = Math.min(contig.length, Math.ceil(m.end)), known = null;
+            if (kind === 'reads-scan') ({ end, total: known } = await sizeScanChunk(contig, sm.bam, start, end));
+            const { total, fraction, reads } = await fetchContigReads(contig, sm.bam, regionOf(contig.name, start, end), READ_REQUESTS[kind], known);
+            reply = { type, id: m.id, start, end, total, fraction, reads };
         } catch (err) {
-            reply = { type: 'reads-window-data', id: m.id, error: String(err?.message || err) };
+            reply = { type, id: m.id, error: String(err?.message || err) };
         }
         if (!win.closed) win.postMessage(reply, window.location.origin);
     }

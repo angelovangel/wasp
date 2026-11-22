@@ -217,7 +217,7 @@ Each file is a track under the reference; loaded files are remembered for other 
                 </label>
                 <button id="dl-var-csv">CSV</button>
                 <button id="dl-var-vcf">VCF</button>
-                <span class="var-note">From the loaded reads: depth ≥ 5 and ≥ 3 reads carrying the allele (insertions: their median length, listed at the base before them). Coverage bars are coloured, and reference bases underlined, where at least this fraction of bases differ from the reference. Click a row to jump there and group reads by base.</span>
+                <span class="var-note">All reads; depth ≥ 5, ≥ 3 reads with the allele. Bars and underlines mark these rows. Click a row to jump there.</span>
             </div>
             <div class="var-table-wrap">
                 <table id="var-table">
@@ -247,7 +247,10 @@ Each file is a track under the reference; loaded files are remembered for other 
     const MIN_CLIP_BP = 20;      // soft clips at least this long count as "clipped" for the pile-up marker
     const MIN_VAR_DEPTH = 5;     // variant table: minimum depth
     const MIN_ALT_READS = 3;     // variant table / clip marker: minimum supporting reads
-    const SCAN_CHUNK = 200000;   // variant scan works in chunks of this many bp
+    const SCAN_CHUNK = 200000;   // sample-based scan: chunks of this many bp
+    const SCAN_MAX_CHUNK = 2000000; // full scan: largest chunk asked for; the main page shrinks it to fit
+                                    // a read budget, and the next request adapts to the last size
+    const SCAN_TIMEOUT_MS = 300000; // no answer for a chunk in this time: fall back to the loaded reads
     const MAX_TABLE_ROWS = 1000; // variant table rows shown (exports include all)
     const WINDOW_MAX_SPAN = 50000; // zoomed in to this span or less, all reads in the window are fetched
     const WINDOW_PAD = 1;          // …plus this many view widths on each side, so panning stays loaded
@@ -725,7 +728,12 @@ Each file is a track under the reference; loaded files are remembered for other 
                 const x0 = xOf(counts.s + i, w), x1 = xOf(counts.s + i + 1, w);
                 const bw = Math.max(1, x1 - x0 - (pxPerBp > 4 ? 1 : 0));
                 const h = tot / max * (COV_H - 4);
-                if (counts.alt[i] >= minAF) { // >= cutoff of the bases differ from the reference
+                const mark = markAt(counts.s + i, i);
+                if (mark.ins) { // insertion after this base: a tick at its right edge
+                    ctx.fillStyle = COL.ins;
+                    ctx.fillRect(x1 - 1, COV_H - h - 6, 2, h + 6);
+                }
+                if (mark.snv) { // called variant (same rule as the table)
                     // stacked bar of A/C/G/T/del proportions
                     let y = COV_H;
                     for (const b of [...BASES, '-']) {
@@ -793,8 +801,8 @@ Each file is a track under the reference; loaded files are remembered for other 
         }
 
         // Reference sequence (letters when zoomed far enough, coloured blocks otherwise).
-        // Where the coverage bar is coloured (>= minAF of the bases differ from the reference), the base
-        // is underlined in the colour of the most common other allele (dark for a deletion).
+        // Where the coverage bar is coloured (a called variant), the base is underlined in the colour
+        // of the called allele (dark for a deletion).
         const refY = COV_H + RULER_H;
         if (data.ref && pxPerBp >= 1) {
             const ps = Math.max(0, Math.floor(view.start)), pe = Math.min(L, Math.ceil(view.end));
@@ -808,10 +816,8 @@ Each file is a track under the reference; loaded files are remembered for other 
                 if (pxPerBp >= 8) ctx.fillText(b, (x0 + x1) / 2, refY + 3);
                 else ctx.fillRect(x0, refY + 5, Math.max(1, x1 - x0), REF_H - 12);
                 const i = counts ? p - counts.s : -1;
-                if (i < 0 || i >= counts.alt.length || counts.alt[i] < minAF) continue; // same rule as the bars
-                let alt = null, altN = 0; // most common non-reference allele
-                for (const a of BASES) if (a !== b && counts.cnt[a][i] > altN) { alt = a; altN = counts.cnt[a][i]; }
-                if (counts.del[i] > altN) { alt = '-'; altN = counts.del[i]; }
+                if (i < 0 || i >= counts.alt.length) continue;
+                const alt = markAt(p, i).snv; // same rule as the bars and the table
                 if (!alt) continue;
                 ctx.globalAlpha = 1;
                 ctx.fillStyle = alt === '-' ? COL.del : baseColor(alt);
@@ -1101,6 +1107,7 @@ Each file is a track under the reference; loaded files are remembered for other 
         winError = '';
         win = { start: m.start, end: m.end, reads: m.reads, total: m.total, fraction: m.fraction };
         render();
+        refineVariants();
     }
 
     function render() {
@@ -1114,38 +1121,133 @@ Each file is a track under the reference; loaded files are remembered for other 
     }
 
     // ---- variants (whole contig, from the loaded reads that pass the MAPQ filter) ----
+    // The one rule for calling a variant at index i of per-base counts `c` (from computeCounts),
+    // used by the table, the coloured coverage bars and the underlined reference bases.
+    // Returns { alt, n, af } for the most common non-reference allele ('-' = deletion) and
+    // { insN, insAf } for an insertion after the base; either is null if it doesn't pass
+    // depth >= MIN_VAR_DEPTH and >= MIN_ALT_READS supporting reads. `minFrac` is the AF cutoff.
+    function callAt(c, i, minFrac) {
+        const tot = c.depth[i] + c.del[i];
+        if (tot < MIN_VAR_DEPTH) return { snv: null, ins: null, tot };
+        const rb = c.ref[i];
+        let alt = null, altN = 0;
+        for (const b of BASES) if (b !== rb && c.cnt[b][i] > altN) { alt = b; altN = c.cnt[b][i]; }
+        if (c.del[i] > altN) { alt = '-'; altN = c.del[i]; }
+        const insN = c.ins[i];
+        return {
+            tot,
+            snv: alt && altN >= MIN_ALT_READS && altN / tot >= minFrac ? { alt, n: altN, af: altN / tot } : null,
+            ins: insN >= MIN_ALT_READS && insN / tot >= minFrac ? { n: insN, af: insN / tot } : null,
+        };
+    }
+
+    // Candidate variants (AF >= ALLELE_FRAC; the cutoff menu filters further) appended to `out`.
+    function collectVariants(c, out) {
+        for (let i = 0; i < c.depth.length; i++) {
+            const { snv, ins, tot } = callAt(c, i, ALLELE_FRAC);
+            if (!snv && !ins) continue;
+            const row = { pos: c.s + i, ref: c.ref[i], depth: tot,
+                A: c.cnt.A[i], C: c.cnt.C[i], G: c.cnt.G[i], T: c.cnt.T[i], del: c.del[i], ins: c.ins[i] };
+            if (snv) out.push({ ...row, ...snv });
+            // insertion after this base: its own row; length = median of the reads' insertion lengths
+            if (ins) {
+                const lens = c.insLens.get(i).sort((a, b) => a - b);
+                out.push({ ...row, alt: 'ins', insLen: lens[lens.length >> 1], ...ins });
+            }
+        }
+    }
+
+    // What to mark at contig position p (index i into `counts`): once the full scan is done, exactly
+    // the table's rows (the view may show a subsample); otherwise the same rule on the reads in view.
+    // Returns { snv: alt allele or null, ins: bool }.
+    let shownIndex = null; // pos -> { snv, ins } for the variants passing the cutoff (full scan only)
+    function markAt(p, i) {
+        if (scanFull && scanDone) {
+            const m = shownIndex?.get(p);
+            return m ? m : { snv: null, ins: false };
+        }
+        const { snv, ins } = callAt(counts, i, minAF);
+        return { snv: snv ? snv.alt : null, ins: !!ins };
+    }
+
+    // All reads of [start, end) from the main page, not subsampled. Rejects if it doesn't answer.
+    let scanReq = 0, scanPending = null; // { id, resolve, reject, timer }
+    function fetchScanChunk(start, end) {
+        return new Promise((resolve, reject) => {
+            if (!window.opener || window.opener.closed) return reject(new Error('the main page was closed'));
+            if (scanPending) { clearTimeout(scanPending.timer); scanPending.reject(new Error('superseded')); }
+            const id = ++scanReq;
+            const timer = setTimeout(() => {
+                if (scanPending?.id !== id) return;
+                scanPending = null;
+                reject(new Error('no answer from the main page'));
+            }, SCAN_TIMEOUT_MS);
+            scanPending = { id, resolve, reject, timer };
+            window.opener.postMessage({ type: 'reads-scan', id, contig: data.contig.name, sample: data.sample, start, end }, location.origin);
+        });
+    }
+    function receiveScanChunk(m) {
+        if (!scanPending || m.id !== scanPending.id) return;
+        const p = scanPending;
+        scanPending = null;
+        clearTimeout(p.timer);
+        if (m.error) p.reject(new Error(m.error)); else p.resolve({ reads: m.reads, end: m.end });
+    }
+
+    // Variant calls over the whole contig from all of its reads, fetched chunk by chunk (only one
+    // chunk's reads are held at a time). If the main page can't supply them, the loaded (sampled)
+    // reads are used instead, and calls in a zoomed-in window are redone from its reads.
+    let scanFull = false, scanNote = '';
     async function scanContig() {
         const token = ++scanToken;
-        variants = []; scanDone = false;
+        variants = []; scanDone = false; refinedWin = null; scanFull = true; scanNote = '';
         updateVariantUI();
         if (!data.ref) { $('var-summary').textContent = `Variants: unavailable (${refWhy()})`; return; }
         const L = data.contig.length;
-        for (let s = 0; s < L; s += SCAN_CHUNK) {
-            const c = computeCounts(s, Math.min(L, s + SCAN_CHUNK), baseFiltered);
-            for (let i = 0; i < c.depth.length; i++) {
-                const tot = c.depth[i] + c.del[i];
-                if (tot < MIN_VAR_DEPTH) continue;
-                const rb = c.ref[i];
-                let alt = null, altN = 0;
-                for (const b of BASES) if (b !== rb && c.cnt[b][i] > altN) { alt = b; altN = c.cnt[b][i]; }
-                if (c.del[i] > altN) { alt = '-'; altN = c.del[i]; }
-                const row = { pos: s + i, ref: rb, depth: tot,
-                    A: c.cnt.A[i], C: c.cnt.C[i], G: c.cnt.G[i], T: c.cnt.T[i], del: c.del[i], ins: c.ins[i] };
-                if (altN >= MIN_ALT_READS && altN / tot >= ALLELE_FRAC) {
-                    variants.push({ ...row, alt, n: altN, af: altN / tot });
-                }
-                // insertion after this base: its own row; length = median of the reads' insertion lengths
-                const insN = c.ins[i];
-                if (insN >= MIN_ALT_READS && insN / tot >= ALLELE_FRAC) {
-                    const lens = c.insLens.get(i).sort((a, b) => a - b);
-                    variants.push({ ...row, alt: 'ins', insLen: lens[lens.length >> 1], n: insN, af: insN / tot });
+        let size = SCAN_CHUNK;
+        for (let s = 0; s < L;) {
+            let e = Math.min(L, s + size);
+            let reads = baseFiltered;
+            if (scanFull) {
+                try {
+                    const got = await fetchScanChunk(s, e);
+                    reads = got.reads.filter(passesFilters);
+                    // the main page shrank the chunk to fit its budget: keep that size; else try larger
+                    size = got.end < e ? got.end - s : Math.min(SCAN_MAX_CHUNK, size * 2);
+                    e = got.end;
+                } catch (err) {
+                    if (token !== scanToken) return;
+                    scanFull = false; scanNote = err.message;
+                    reads = baseFiltered; size = SCAN_CHUNK;
                 }
             }
-            $('var-summary').textContent = `Variants: scanning… ${Math.round(Math.min(L, s + SCAN_CHUNK) / L * 100)}%`;
+            if (token !== scanToken) return; // a newer scan started
+            collectVariants(computeCounts(s, e, reads), variants);
+            $('var-summary').textContent = `Variants: scanning ${scanFull ? 'all reads' : 'loaded reads'}… ${Math.round(e / L * 100)}%`;
+            s = e;
             await new Promise(res => setTimeout(res)); // keep the page responsive
-            if (token !== scanToken) return;          // a newer scan started
+            if (token !== scanToken) return;
         }
         scanDone = true;
+        refineVariants();
+        updateVariantUI();
+        drawTopTracks(); // bars and underlines now follow the table
+    }
+
+    // Sample-based scan only: once all reads of a window are loaded, redo the calls there from
+    // them, so the table agrees with the coverage bars.
+    let refinedWin = null;
+    function refineVariants() {
+        if (scanFull || !scanDone || !win || !data.ref || refinedWin === win) return;
+        refinedWin = win;
+        const reads = win.reads.filter(passesFilters);
+        const fresh = [];
+        collectVariants(computeCounts(win.start, win.end, reads), fresh);
+        const lo = variants.findIndex(v => v.pos >= win.start);
+        const a = lo < 0 ? variants.length : lo;
+        let b = a;
+        while (b < variants.length && variants[b].pos < win.end) b++;
+        variants.splice(a, b - a, ...fresh);
         updateVariantUI();
     }
 
@@ -1153,9 +1255,16 @@ Each file is a track under the reference; loaded files are remembered for other 
 
     function updateVariantUI() {
         const vs = shownVariants();
+        shownIndex = new Map();
+        for (const v of vs) {
+            const m = shownIndex.get(v.pos) || { snv: null, ins: false };
+            if (v.alt === 'ins') m.ins = true; else m.snv = v.alt;
+            shownIndex.set(v.pos, m);
+        }
         const done = scanDone;
         $('var-summary').textContent = done
-            ? `Variants: ${vs.length.toLocaleString()} at allele frequency ≥ ${minAF}${filterNote()}`
+            ? `Variants: ${vs.length.toLocaleString()} at allele frequency ≥ ${minAF}${filterNote()}` +
+              (scanFull ? ', all reads' : `, loaded reads only (${scanNote})`)
             : 'Variants: scanning…';
         for (const id of ['prev-var', 'next-var', 'dl-var-csv', 'dl-var-vcf']) $(id).disabled = !done || !vs.length;
         const rowsHtml = vs.slice(0, MAX_TABLE_ROWS).map(v =>
@@ -1621,6 +1730,7 @@ Each file is a track under the reference; loaded files are remembered for other 
         if (e.origin !== location.origin) return;
         if (e.data?.type === 'reads-data') show(e.data);
         if (e.data?.type === 'reads-window-data' && data) receiveWindow(e.data);
+        if (e.data?.type === 'reads-scan-data' && data) receiveScanChunk(e.data);
     });
 
     if (window.opener) {
