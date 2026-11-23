@@ -151,6 +151,18 @@ function renderSparklines(root) {
 // Without -a only covered positions are printed, so bins with missing positions have min 0.
 // Deletions are not counted as coverage (samtools depth default), so they show as dips.
 
+// Run `samtools <cmd> -o FILE ...` and return FILE as text. Much faster than taking its stdout,
+// which reaches JS line by line: use it for commands with big output. If samtools wrote no file
+// (an error), returns what exec printed instead, as exec alone would have.
+let outFileN = 0;
+async function samtoolsText(args) {
+    const out = `out${++outFileN}.txt`;
+    const log = await CLI.exec("samtools", [args[0], "-o", out, ...args.slice(1)]);
+    try { return new TextDecoder().decode(await CLI.fs.readFile(out)); }
+    catch { return log; }
+    finally { try { await CLI.fs.unlink(out); } catch {} }
+}
+
 // Add one `samtools depth` output into the per-contig bin sums (walks it without splitting it)
 function addDepthOutput(out, acc) {
     let cur = null, curName = null;
@@ -195,10 +207,10 @@ async function depthProfiles(contigs, bam, progress = () => {}) {
     if (!viaBedcov.length && short.length) {
         if (long.length) {
             await CLI.fs.writeFile("short.bed", short.map(c => `${c.name}\t0\t${c.length}`).join('\n') + '\n');
-            addDepthOutput(await CLI.exec("samtools", ["depth", "-d", "0", "-b", "short.bed", bam]), acc);
+            addDepthOutput(await samtoolsText(["depth", "-d", "0", "-b", "short.bed", bam]), acc);
             await CLI.fs.unlink("short.bed");
         } else {
-            addDepthOutput(await CLI.exec("samtools", ["depth", "-d", "0", bam]), acc);
+            addDepthOutput(await samtoolsText(["depth", "-d", "0", bam]), acc);
         }
         doneBp += shortBp;
         progress(doneBp / totalBp);
@@ -207,7 +219,7 @@ async function depthProfiles(contigs, bam, progress = () => {}) {
     for (const c of long) {
         for (let st = 0; st < c.length; st += DEPTH_CHUNK_BP) {
             const en = Math.min(c.length, st + DEPTH_CHUNK_BP);
-            addDepthOutput(await CLI.exec("samtools", ["depth", "-d", "0", "-r", regionOf(c.name, st, en), bam]), acc);
+            addDepthOutput(await samtoolsText(["depth", "-d", "0", "-r", regionOf(c.name, st, en), bam]), acc);
             doneBp += en - st;
             progress(doneBp / totalBp);
         }
@@ -1350,7 +1362,7 @@ async function fetchContigReads(contig, bam, region = regionOf(contig.name), lim
         args.push("-s", `42${fraction.toFixed(6).slice(1)}`);
     }
     args.push(bam, region);
-    const sam = await CLI.exec("samtools", args);
+    const sam = await samtoolsText(args);
 
     // Reference bases for mismatch calling; refNote says why when they can't be used
     const { seq: ref, reason: refNote } = await readContigSeq(referenceFile, contig.name, contig.length);
@@ -1367,22 +1379,47 @@ async function fetchContigReads(contig, bam, region = regionOf(contig.name), lim
 const MAX_WINDOW_READS = 20000;
 // Per reads tab and request kind, one fetch at a time; the latest request wins.
 //   reads-window: reads around the zoomed-in view, subsampled to MAX_WINDOW_READS
-//   reads-scan:   one chunk of the variant scan, all reads (the tab asks for the next chunk when done)
-// Variant-scan chunks hold at most about this many aligned bases (SAM text is ~2-3 bytes per base,
-// so this keeps each chunk's samtools output well under browser string limits).
-const SCAN_MAX_BASES = 30e6;
+//   reads-scan:   one chunk of the variant scan, called here (scanChunk); the tab asks for the next when done
+// Variant-scan chunks span about this many aligned bases (span x the contig's mean depth), so a
+// chunk's SAM text stays well under browser string limits. Sized from the depth, not counted.
+const SCAN_CHUNK_BASES = 12e6;
 const SCAN_MIN_BP = 500;
+let scanFileN = 0;
 
-// Shrink [start, end) until its reads carry about SCAN_MAX_BASES at most, estimated from the read
-// count and the contig's mean aligned read length. Returns the (possibly smaller) end and the count.
-async function sizeScanChunk(contig, bam, start, end) {
-    const meanLen = Math.max(100, (parseFloat(contig.meandepth) || 0) * contig.length / Math.max(1, contig.numreads || 0)) || 1000;
-    for (;;) {
-        const total = await countReads(bam, regionOf(contig.name, start, end));
-        const span = end - start;
-        if (total * meanLen <= SCAN_MAX_BASES || span <= SCAN_MIN_BP) return { end, total };
-        end = start + Math.max(SCAN_MIN_BP, Math.floor(span * SCAN_MAX_BASES / (total * meanLen) * 0.8));
+// One chunk of the variant scan: all reads of [start, end) (end shortened to the chunk budget),
+// parsed, filtered like the reads view (MAPQ, supplementary), counted and called here (pileup.js),
+// so only the variant rows go back to the tab. samtools writes the SAM to a file, read back in one
+// piece: much faster than its stdout, which reaches JS line by line.
+// `timing`: ms per stage and the SAM size, for the console.
+async function scanChunk(contig, bam, m) {
+    const ms = () => performance.now();
+    const start = Math.max(0, Math.floor(m.start));
+    const span = Math.max(SCAN_MIN_BP, Math.round(SCAN_CHUNK_BASES / Math.max(1, parseFloat(contig.meandepth) || 1)));
+    const end = Math.min(contig.length, Math.ceil(m.end), start + span);
+    const t0 = ms();
+    const out = `scan${++scanFileN}.sam`;
+    await CLI.exec("samtools", ["view", "-F", EXCLUDE_FLAGS, "-o", out, bam, regionOf(contig.name, start, end)]);
+    const t1 = ms();
+    let sam;
+    try { sam = new TextDecoder().decode(await CLI.fs.readFile(out)); }
+    finally { try { await CLI.fs.unlink(out); } catch {} }
+    const t2 = ms();
+    const { seq: ref, reason } = await readContigSeq(referenceFile, contig.name, contig.length);
+    if (!ref) throw new Error(`no reference sequence (${reason})`);
+    const reads = [];
+    let parsed = 0;
+    for (const line of sam.split('\n')) {
+        const r = parseSamRead(line, ref);
+        if (!r) continue;
+        parsed++;
+        if (r.mapq >= m.minMapq && (m.showSupp || !r.supplementary)) reads.push(r);
     }
+    const t3 = ms();
+    const rows = [];
+    collectVariants(countBases(reads, ref, start, end), rows);
+    const t4 = ms();
+    return { start, end, rows, timing: { view: t1 - t0, read: t2 - t1, parse: t3 - t2, call: t4 - t3,
+        samMB: sam.length / 1e6, reads: parsed, rows: rows.length } };
 }
 
 const READ_REQUESTS = { 'reads-window': MAX_WINDOW_READS, 'reads-scan': Infinity };
@@ -1410,11 +1447,13 @@ async function runWindowJobs(win, job, kind) {
             const sm = samples.find(x => x.name === m.sample) || (samples.length === 1 ? samples[0] : null);
             const contig = sm?.contigs.find(c => c.name === m.contig);
             if (!contig) throw new Error('contig not found');
-            const start = Math.max(0, Math.floor(m.start));
-            let end = Math.min(contig.length, Math.ceil(m.end)), known = null;
-            if (kind === 'reads-scan') ({ end, total: known } = await sizeScanChunk(contig, sm.bam, start, end));
-            const { total, fraction, reads } = await fetchContigReads(contig, sm.bam, regionOf(contig.name, start, end), READ_REQUESTS[kind], known);
-            reply = { type, id: m.id, start, end, total, fraction, reads };
+            if (kind === 'reads-scan') {
+                reply = { type, id: m.id, ...await scanChunk(contig, sm.bam, m) };
+            } else {
+                const start = Math.max(0, Math.floor(m.start)), end = Math.min(contig.length, Math.ceil(m.end));
+                const { total, fraction, reads } = await fetchContigReads(contig, sm.bam, regionOf(contig.name, start, end), READ_REQUESTS[kind]);
+                reply = { type, id: m.id, start, end, total, fraction, reads };
+            }
         } catch (err) {
             reply = { type, id: m.id, error: String(err?.message || err) };
         }

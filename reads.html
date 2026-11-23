@@ -237,16 +237,13 @@ Each file is a track under the reference; loaded files are remembered for other 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/pako/2.1.0/pako_inflate.min.js"></script>
 <script src="common.js"></script>
 <script src="annotation.js"></script>
+<script src="pileup.js"></script>
 <script>
 (() => {
     const DETAIL_SPAN = 20000;   // per-base counts and allele colours below this span
     const MM_MAX_BPPX = 10;      // draw read mismatches/small indels when <= this many bp per pixel
-    const ALLELE_FRAC = 0.2;     // lowest allele frequency the variant scan keeps (the cutoff menu filters these)
     const COV_H = 90, RULER_H = 22, REF_H = 22, ROW_GAP = 1, HEADER_H = 18;
     const TRACKS_Y = COV_H + RULER_H + REF_H; // annotation tracks start here (top canvas)
-    const MIN_CLIP_BP = 20;      // soft clips at least this long count as "clipped" for the pile-up marker
-    const MIN_VAR_DEPTH = 5;     // variant table: minimum depth
-    const MIN_ALT_READS = 3;     // variant table / clip marker: minimum supporting reads
     const SCAN_CHUNK = 200000;   // sample-based scan: chunks of this many bp
     const SCAN_MAX_CHUNK = 2000000; // full scan: largest chunk asked for; the main page shrinks it to fit
                                     // a read budget, and the next request adapts to the last size
@@ -266,7 +263,6 @@ Each file is a track under the reference; loaded files are remembered for other 
     // Annotation track
     const FEAT_TOP = 14, FEAT_ROW_H = 20, FEAT_BOX_H = 8;
     const FEAT_STORE_KEY = 'wasp-features';
-    const BASES = ['A', 'C', 'G', 'T'];
     const baseColor = b => COL[b] || COL.muted;
 
     const $ = id => document.getElementById(id);
@@ -633,68 +629,8 @@ Each file is a track under the reference; loaded files are remembered for other 
             : '';
     }
 
-    // Per-base counts over [s, e) from all loaded reads (including any hidden from the pile):
-    //   depth (reads spanning, excl. deletions), del, A/C/G/T, consensus base per position.
-    // Reference bases come from data.ref; reads only carry their mismatches.
-    function computeCounts(s, e, reads = filtered) {
-        s = Math.max(0, Math.floor(s)); e = Math.min(data.contig.length, Math.ceil(e));
-        const n = e - s;
-        // Difference arrays (+1 at start, -1 at end) so each read costs O(its features), not O(length)
-        const span = new Int32Array(n + 1);     // reads whose aligned blocks cover the base
-        const smallDel = new Int32Array(n + 1); // short deletions (inside a block)
-        const longDel = new Int32Array(n + 1);  // long deletions (gap between blocks)
-        const mm = { A: new Int32Array(n), C: new Int32Array(n), G: new Int32Array(n), T: new Int32Array(n) };
-        const addRange = (arr, a, b) => {
-            a = Math.max(a, s); b = Math.min(b, e);
-            if (a < b) { arr[a - s]++; arr[b - s]--; }
-        };
-        const clip = new Int32Array(n);   // reads with a long soft clip starting/ending here
-        const ins = new Int32Array(n);    // reads with an insertion right after this base
-        const insLens = new Map();        // index -> insertion lengths there
-        for (const r of reads) {
-            if (r.end <= s || r.start >= e) continue;
-            if (r.clipL >= MIN_CLIP_BP && r.start >= s && r.start < e) clip[r.start - s]++;
-            if (r.clipR >= MIN_CLIP_BP && r.end - 1 >= s && r.end - 1 < e) clip[r.end - 1 - s]++;
-            for (let b = 0; b < r.blocks.length; b += 2) addRange(span, r.blocks[b], r.blocks[b + 1]);
-            for (let d = 0; d < r.dels.length; d += 2) {
-                const p = r.dels[d], len = r.dels[d + 1];
-                addRange(len < MIN_GAP_BP ? smallDel : longDel, p, p + len);
-            }
-            for (let m = 0; m < r.mmPos.length; m++) {
-                const p = r.mmPos[m], b = r.mmBase[m];
-                if (p >= s && p < e && mm[b]) mm[b][p - s]++;
-            }
-            for (let k = 0; k < r.ins.length; k += 2) {
-                const a = r.ins[k] - 1; // r.ins holds the position the insertion precedes
-                if (a < s || a >= e) continue;
-                ins[a - s]++;
-                const l = insLens.get(a - s);
-                if (l) l.push(r.ins[k + 1]); else insLens.set(a - s, [r.ins[k + 1]]);
-            }
-        }
-        const depth = new Int32Array(n), del = new Int32Array(n);
-        const cnt = { A: new Int32Array(n), C: new Int32Array(n), G: new Int32Array(n), T: new Int32Array(n) };
-        const ref = new Array(n), cons = new Array(n), alt = new Float32Array(n);
-        let sp = 0, sd = 0, ld = 0;
-        for (let i = 0; i < n; i++) {
-            sp += span[i]; sd += smallDel[i]; ld += longDel[i];
-            const aligned = Math.max(0, sp - sd);   // reads with a base here
-            const dels = sd + ld;                   // reads with a deletion here
-            const rb = data.ref[s + i];
-            let mmSum = 0;
-            for (const b of BASES) { cnt[b][i] = mm[b][i]; mmSum += mm[b][i]; }
-            if (cnt[rb]) cnt[rb][i] += Math.max(0, aligned - mmSum); // the rest match the reference
-            depth[i] = aligned; del[i] = dels; ref[i] = rb;
-            // consensus = most common of A/C/G/T/deletion
-            let best = '', bestN = 0;
-            for (const b of BASES) if (cnt[b][i] > bestN) { best = b; bestN = cnt[b][i]; }
-            if (dels > bestN) best = '-';
-            cons[i] = best;
-            const tot = aligned + dels;
-            alt[i] = tot > 0 && cnt[rb] ? 1 - cnt[rb][i] / tot : 0;
-        }
-        return { s, e, depth, del, cnt, ref, cons, alt, clip, ins, insLens };
-    }
+    // Per-base counts over [s, e) (pileup.js), by default from the reads in use
+    const computeCounts = (s, e, reads = filtered) => countBases(reads, data.ref, s, e);
 
     function setupCanvas(canvas, cssHeight) {
         const dpr = window.devicePixelRatio || 1;
@@ -1121,42 +1057,6 @@ Each file is a track under the reference; loaded files are remembered for other 
     }
 
     // ---- variants (whole contig, from the loaded reads that pass the MAPQ filter) ----
-    // The one rule for calling a variant at index i of per-base counts `c` (from computeCounts),
-    // used by the table, the coloured coverage bars and the underlined reference bases.
-    // Returns { alt, n, af } for the most common non-reference allele ('-' = deletion) and
-    // { insN, insAf } for an insertion after the base; either is null if it doesn't pass
-    // depth >= MIN_VAR_DEPTH and >= MIN_ALT_READS supporting reads. `minFrac` is the AF cutoff.
-    function callAt(c, i, minFrac) {
-        const tot = c.depth[i] + c.del[i];
-        if (tot < MIN_VAR_DEPTH) return { snv: null, ins: null, tot };
-        const rb = c.ref[i];
-        let alt = null, altN = 0;
-        for (const b of BASES) if (b !== rb && c.cnt[b][i] > altN) { alt = b; altN = c.cnt[b][i]; }
-        if (c.del[i] > altN) { alt = '-'; altN = c.del[i]; }
-        const insN = c.ins[i];
-        return {
-            tot,
-            snv: alt && altN >= MIN_ALT_READS && altN / tot >= minFrac ? { alt, n: altN, af: altN / tot } : null,
-            ins: insN >= MIN_ALT_READS && insN / tot >= minFrac ? { n: insN, af: insN / tot } : null,
-        };
-    }
-
-    // Candidate variants (AF >= ALLELE_FRAC; the cutoff menu filters further) appended to `out`.
-    function collectVariants(c, out) {
-        for (let i = 0; i < c.depth.length; i++) {
-            const { snv, ins, tot } = callAt(c, i, ALLELE_FRAC);
-            if (!snv && !ins) continue;
-            const row = { pos: c.s + i, ref: c.ref[i], depth: tot,
-                A: c.cnt.A[i], C: c.cnt.C[i], G: c.cnt.G[i], T: c.cnt.T[i], del: c.del[i], ins: c.ins[i] };
-            if (snv) out.push({ ...row, ...snv });
-            // insertion after this base: its own row; length = median of the reads' insertion lengths
-            if (ins) {
-                const lens = c.insLens.get(i).sort((a, b) => a - b);
-                out.push({ ...row, alt: 'ins', insLen: lens[lens.length >> 1], ...ins });
-            }
-        }
-    }
-
     // What to mark at contig position p (index i into `counts`): once the full scan is done, exactly
     // the table's rows (the view may show a subsample); otherwise the same rule on the reads in view.
     // Returns { snv: alt allele or null, ins: bool }.
@@ -1183,7 +1083,8 @@ Each file is a track under the reference; loaded files are remembered for other 
                 reject(new Error('no answer from the main page'));
             }, SCAN_TIMEOUT_MS);
             scanPending = { id, resolve, reject, timer };
-            window.opener.postMessage({ type: 'reads-scan', id, contig: data.contig.name, sample: data.sample, start, end }, location.origin);
+            window.opener.postMessage({ type: 'reads-scan', id, contig: data.contig.name, sample: data.sample, start, end,
+                minMapq, showSupp }, location.origin);
         });
     }
     function receiveScanChunk(m) {
@@ -1191,12 +1092,13 @@ Each file is a track under the reference; loaded files are remembered for other 
         const p = scanPending;
         scanPending = null;
         clearTimeout(p.timer);
-        if (m.error) p.reject(new Error(m.error)); else p.resolve({ reads: m.reads, end: m.end });
+        if (m.error) p.reject(new Error(m.error)); else p.resolve(m);
     }
 
-    // Variant calls over the whole contig from all of its reads, fetched chunk by chunk (only one
-    // chunk's reads are held at a time). If the main page can't supply them, the loaded (sampled)
-    // reads are used instead, and calls in a zoomed-in window are redone from its reads.
+    // Variant calls over the whole contig from all of its reads: the main page calls them chunk by
+    // chunk and sends back only the rows. If it can't, the loaded (sampled) reads are scanned here
+    // instead, and calls in a zoomed-in window are redone from its reads.
+    // Timing per chunk and a total are logged to the console ([variant scan]).
     let scanFull = false, scanNote = '';
     async function scanContig() {
         const token = ++scanToken;
@@ -1204,31 +1106,46 @@ Each file is a track under the reference; loaded files are remembered for other 
         updateVariantUI();
         if (!data.ref) { $('var-summary').textContent = `Variants: unavailable (${refWhy()})`; return; }
         const L = data.contig.length;
+        const T0 = performance.now(), tot = { chunks: 0, view: 0, read: 0, parse: 0, call: 0, samMB: 0, reads: 0, wait: 0 };
         let size = SCAN_CHUNK;
         for (let s = 0; s < L;) {
             let e = Math.min(L, s + size);
-            let reads = baseFiltered;
+            let rows = null; // called by the main page
             if (scanFull) {
                 try {
+                    const t = performance.now();
                     const got = await fetchScanChunk(s, e);
-                    reads = got.reads.filter(passesFilters);
-                    // the main page shrank the chunk to fit its budget: keep that size; else try larger
+                    const g = got.timing, wait = performance.now() - t, other = wait - g.view - g.read - g.parse - g.call;
+                    console.log(`[variant scan] ${formatBp(s)}–${formatBp(got.end)}: ${g.reads.toLocaleString()} reads, ` +
+                        `${g.samMB.toFixed(1)} MB SAM · samtools ${g.view.toFixed(0)} · read file ${g.read.toFixed(0)} · ` +
+                        `parse ${g.parse.toFixed(0)} · count+call ${g.call.toFixed(0)} · messaging/other ${other.toFixed(0)} ms`);
+                    tot.chunks++; tot.wait += wait;
+                    for (const k of ['view', 'read', 'parse', 'call', 'samMB', 'reads']) tot[k] += g[k];
+                    rows = got.rows;
+                    // the main page shortened the chunk to its budget: keep that size; else try larger
                     size = got.end < e ? got.end - s : Math.min(SCAN_MAX_CHUNK, size * 2);
                     e = got.end;
                 } catch (err) {
                     if (token !== scanToken) return;
-                    scanFull = false; scanNote = err.message;
-                    reads = baseFiltered; size = SCAN_CHUNK;
+                    scanFull = false; scanNote = err.message; size = SCAN_CHUNK;
                 }
             }
             if (token !== scanToken) return; // a newer scan started
-            collectVariants(computeCounts(s, e, reads), variants);
+            if (rows) for (const v of rows) variants.push(v);
+            else collectVariants(computeCounts(s, e, baseFiltered), variants);
             $('var-summary').textContent = `Variants: scanning ${scanFull ? 'all reads' : 'loaded reads'}… ${Math.round(e / L * 100)}%`;
             s = e;
             await new Promise(res => setTimeout(res)); // keep the page responsive
             if (token !== scanToken) return;
         }
         scanDone = true;
+        if (tot.chunks) {
+            const f = x => `${(x / 1000).toFixed(1)} s`;
+            console.log(`[variant scan] total ${f(performance.now() - T0)} for ${formatBp(L)}, ${tot.chunks} chunks, ` +
+                `${tot.reads.toLocaleString()} reads, ${tot.samMB.toFixed(0)} MB SAM · samtools ${f(tot.view)} · read file ${f(tot.read)} · ` +
+                `parse ${f(tot.parse)} · count+call ${f(tot.call)} · messaging/other ${f(tot.wait - tot.view - tot.read - tot.parse - tot.call)}` +
+                ` · in this tab ${f(performance.now() - T0 - tot.wait)}${scanFull ? '' : ` (fell back: ${scanNote})`}`);
+        }
         refineVariants();
         updateVariantUI();
         drawTopTracks(); // bars and underlines now follow the table
