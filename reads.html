@@ -179,6 +179,8 @@
             <label class="group" id="pairs-box" hidden data-tip="Show the two mates of a read pair in one row, joined by a line.
 Grouping by strand then uses the strand of the first mate (R1)."><input type="checkbox" id="show-pairs" checked> pairs</label>
             <label class="group" data-tip="Show soft-clipped read ends"><input type="checkbox" id="show-clips" checked> clips</label>
+            <label class="group" data-tip="Hide insertions and deletions of up to this many bases in the reads (0: show all), like IGV.
+Only the drawing changes: depth, colours and variants still count them.">hide indels ≤ <input type="number" id="hide-indels" value="0" min="0" step="1" style="width: 3.5em" aria-label="Hide indels up to this many bases"> bp</label>
             <label class="group" data-tip="Include supplementary alignments (other parts of split reads).
 Unticked, they are hidden and left out of depth and variants."><input type="checkbox" id="show-supp" checked> suppl.</label>
             <button id="dl-png" data-tip="Save the current view (depth, reference, feature tracks and reads) as a PNG image">PNG</button>
@@ -299,6 +301,7 @@ Each file is a track under the reference; loaded files are remembered for other 
     let winReq = 0, winLoading = false, winTimer = null, winError = '';
     let readSet = null;       // which reads `filtered` was built from (data.reads or win.reads)
     let showClips = true;
+    let hideIndelBp = 0;      // indels up to this length are not drawn (IGV's "hide small indels")
     let showPairs = true;     // mates of a read pair share a row, joined by a line
     let hasPairs = false;     // the reads are paired-end
     let showSupp = true;      // include supplementary alignments (pile, depth and variants)
@@ -836,15 +839,16 @@ Each file is a track under the reference; loaded files are remembered for other 
                 }
                 ctx.globalAlpha = baseAlpha;
                 // thin line under the whole read, so long deletions show as gaps
-                if (r.blocks.length > 2) {
+                const blocks = drawnBlocks(r);
+                if (blocks.length > 2) {
                     ctx.fillStyle = COL.del;
                     const x0 = xOf(r.start, w), x1 = xOf(r.end, w);
                     ctx.fillRect(x0, y + Math.floor(rowH / 2), Math.max(1, x1 - x0), 1);
                 }
                 // supplementary alignments: diagonal stripes with an outline instead of a solid fill
                 ctx.fillStyle = r.supplementary && rowH > 1 ? stripePattern(ctx, color) : color;
-                for (let b = 0; b < r.blocks.length; b += 2) {
-                    const x0 = xOf(r.blocks[b], w), x1 = xOf(r.blocks[b + 1], w);
+                for (let b = 0; b < blocks.length; b += 2) {
+                    const x0 = xOf(blocks[b], w), x1 = xOf(blocks[b + 1], w);
                     ctx.fillRect(x0, y, Math.max(1, x1 - x0), rowH);
                     if (r.supplementary && rowH > 1) {
                         ctx.strokeStyle = color;
@@ -856,7 +860,7 @@ Each file is a track under the reference; loaded files are remembered for other 
                     // short deletions: cut the read and draw a thin line across the gap
                     for (let d = 0; d < r.dels.length; d += 2) {
                         const p = r.dels[d], len = r.dels[d + 1];
-                        if (len >= MIN_GAP_BP || p + len < view.start || p > view.end) continue;
+                        if (len >= MIN_GAP_BP || len <= hideIndelBp || p + len < view.start || p > view.end) continue;
                         const x0 = xOf(p, w), x1 = xOf(p + len, w);
                         ctx.fillStyle = COL.panel;
                         ctx.fillRect(x0, y, Math.max(1, x1 - x0), rowH);
@@ -881,7 +885,7 @@ Each file is a track under the reference; loaded files are remembered for other 
                 if (r.ins.length && bpPerPx < 50) {
                     ctx.fillStyle = COL.ins;
                     for (let k = 0; k < r.ins.length; k += 2) {
-                        if (!detail && r.ins[k + 1] < MIN_INS_BP) continue;
+                        if ((!detail && r.ins[k + 1] < MIN_INS_BP) || r.ins[k + 1] <= hideIndelBp) continue;
                         const p = r.ins[k];
                         if (p < view.start || p > view.end) continue;
                         ctx.fillRect(xOf(p, w) - 0.75, y - (rowH > 1 ? 1 : 0), 1.5, rowH + (rowH > 1 ? 2 : 0));
@@ -931,6 +935,21 @@ Each file is a track under the reference; loaded files are remembered for other 
 
     const readColor = r => r.reverse ? COL.rev : COL.fwd; // by strand
 
+    // A read's aligned blocks as drawn: gaps that are deletions of up to hideIndelBp are closed
+    // (only long deletions, >= MIN_GAP_BP, split a read into blocks)
+    function drawnBlocks(r) {
+        if (hideIndelBp < MIN_GAP_BP || r.blocks.length <= 2) return r.blocks;
+        const out = [r.blocks[0], r.blocks[1]];
+        for (let b = 2; b < r.blocks.length; b += 2) {
+            const gapStart = out[out.length - 1], gap = r.blocks[b] - gapStart;
+            let hidden = false;
+            for (let d = 0; d < r.dels.length; d += 2) if (r.dels[d] === gapStart && r.dels[d + 1] === gap) { hidden = gap <= hideIndelBp; break; }
+            if (hidden) out[out.length - 1] = r.blocks[b + 1];
+            else out.push(r.blocks[b], r.blocks[b + 1]);
+        }
+        return out;
+    }
+
     // Indel size labels (row height 10 px): deletion length inside the gap when it fits,
     // insertion length in a small purple box (IGV-style)
     function drawIndelLabels(ctx, r, y, w, detail, pxPerBp) {
@@ -942,7 +961,7 @@ Each file is a track under the reference; loaded files are remembered for other 
         const cy = y + rowH / 2 + 0.5;
         for (let d = 0; d < r.dels.length; d += 2) {
             const p = r.dels[d], len = r.dels[d + 1];
-            if (len < MIN_GAP_BP && !detail) continue;
+            if ((len < MIN_GAP_BP && !detail) || len <= hideIndelBp) continue;
             if (p + len < view.start || p > view.end) continue;
             const x0 = xOf(p, w), x1 = xOf(p + len, w), label = String(len);
             const tw = ctx.measureText(label).width;
@@ -955,7 +974,7 @@ Each file is a track under the reference; loaded files are remembered for other 
         for (let k = 0; k < r.ins.length; k += 2) {
             const p = r.ins[k], len = r.ins[k + 1];
             if (p < view.start || p > view.end) continue;
-            if (!(len >= MIN_INS_BP || (detail && pxPerBp >= 2 && len >= 2) || pxPerBp >= 8)) continue;
+            if (!(len >= MIN_INS_BP || (detail && pxPerBp >= 2 && len >= 2) || pxPerBp >= 8) || len <= hideIndelBp) continue;
             const label = String(len), tw = ctx.measureText(label).width, x = xOf(p, w);
             ctx.fillStyle = COL.ins;
             ctx.fillRect(x - tw / 2 - 2, y, tw + 4, rowH);
@@ -1497,6 +1516,11 @@ Each file is a track under the reference; loaded files are remembered for other 
     $('min-mapq').addEventListener('change', e => { minMapq = parseInt(e.target.value, 10); if (data) applyMapqFilter(); });
     $('show-pairs').addEventListener('change', e => { showPairs = e.target.checked; if (data) { repack(); render(); } });
     $('show-clips').addEventListener('change', e => { showClips = e.target.checked; if (data) render(); });
+    $('hide-indels').addEventListener('input', e => {
+        const v = Math.floor(parseFloat(e.target.value));
+        hideIndelBp = v > 0 ? v : 0;
+        if (data) render();
+    });
     $('show-supp').addEventListener('change', e => { showSupp = e.target.checked; if (data) applyMapqFilter(); });
     $('min-af').addEventListener('change', e => { minAF = parseFloat(e.target.value); updateVariantUI(); if (data) render(); });
     $('prev-var').addEventListener('click', () => stepVariant(-1));
