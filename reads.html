@@ -1098,7 +1098,6 @@ Each file is a track under the reference; loaded files are remembered for other 
     // Variant calls over the whole contig from all of its reads: the main page calls them chunk by
     // chunk and sends back only the rows. If it can't, the loaded (sampled) reads are scanned here
     // instead, and calls in a zoomed-in window are redone from its reads.
-    // Timing per chunk and a total are logged to the console ([variant scan]).
     let scanFull = false, scanNote = '';
     async function scanContig() {
         const token = ++scanToken;
@@ -1106,21 +1105,13 @@ Each file is a track under the reference; loaded files are remembered for other 
         updateVariantUI();
         if (!data.ref) { $('var-summary').textContent = `Variants: unavailable (${refWhy()})`; return; }
         const L = data.contig.length;
-        const T0 = performance.now(), tot = { chunks: 0, view: 0, read: 0, parse: 0, call: 0, samMB: 0, reads: 0, wait: 0 };
         let size = SCAN_CHUNK;
         for (let s = 0; s < L;) {
             let e = Math.min(L, s + size);
             let rows = null; // called by the main page
             if (scanFull) {
                 try {
-                    const t = performance.now();
                     const got = await fetchScanChunk(s, e);
-                    const g = got.timing, wait = performance.now() - t, other = wait - g.view - g.read - g.parse - g.call;
-                    console.log(`[variant scan] ${formatBp(s)}–${formatBp(got.end)}: ${g.reads.toLocaleString()} reads, ` +
-                        `${g.samMB.toFixed(1)} MB SAM · samtools ${g.view.toFixed(0)} · read file ${g.read.toFixed(0)} · ` +
-                        `parse ${g.parse.toFixed(0)} · count+call ${g.call.toFixed(0)} · messaging/other ${other.toFixed(0)} ms`);
-                    tot.chunks++; tot.wait += wait;
-                    for (const k of ['view', 'read', 'parse', 'call', 'samMB', 'reads']) tot[k] += g[k];
                     rows = got.rows;
                     // the main page shortened the chunk to its budget: keep that size; else try larger
                     size = got.end < e ? got.end - s : Math.min(SCAN_MAX_CHUNK, size * 2);
@@ -1139,13 +1130,6 @@ Each file is a track under the reference; loaded files are remembered for other 
             if (token !== scanToken) return;
         }
         scanDone = true;
-        if (tot.chunks) {
-            const f = x => `${(x / 1000).toFixed(1)} s`;
-            console.log(`[variant scan] total ${f(performance.now() - T0)} for ${formatBp(L)}, ${tot.chunks} chunks, ` +
-                `${tot.reads.toLocaleString()} reads, ${tot.samMB.toFixed(0)} MB SAM · samtools ${f(tot.view)} · read file ${f(tot.read)} · ` +
-                `parse ${f(tot.parse)} · count+call ${f(tot.call)} · messaging/other ${f(tot.wait - tot.view - tot.read - tot.parse - tot.call)}` +
-                ` · in this tab ${f(performance.now() - T0 - tot.wait)}${scanFull ? '' : ` (fell back: ${scanNote})`}`);
-        }
         refineVariants();
         updateVariantUI();
         drawTopTracks(); // bars and underlines now follow the table

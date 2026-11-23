@@ -549,8 +549,9 @@ async function runSample({ name, files, target, preset, sampling, refBp, batchBa
             "-o", sam, target, ...fq
         ]);
         for (const f of fq) await a.fs.unlink(f);
-        // -m caps the sort buffer so samtools spills to temp files
-        await a.exec("samtools", ["sort", "-m", "200M", "-o", out, sam]);
+        // -m caps the sort buffer so samtools spills to temp files; -l 1: fast compression (the
+        // batch BAMs are only read back by the merge)
+        await a.exec("samtools", ["sort", "-m", "200M", "-l", "1", "-o", out, sam]);
         await a.fs.unlink(sam);
         if (a !== CLI) { // move the BAM over to CLI, where it is merged and analysed
             await CLI.fs.writeFile(out, await a.fs.readFile(out));
@@ -599,7 +600,9 @@ async function runSample({ name, files, target, preset, sampling, refBp, batchBa
         bam = batchBams[0]; // one batch: it is the BAM
     } else {
         progress(0.76, `Merging ${batchBams.length} batches…`);
-        await CLI.exec("samtools", ["merge", "-f", "-o", bam, ...batchBams]);
+        // -l 1: fast compression. The merge is single-threaded and mostly compression; the BAM
+        // comes out maybe 20-30% larger than at the default level.
+        await CLI.exec("samtools", ["merge", "-f", "-l", "1", "-o", bam, ...batchBams]);
         for (const f of batchBams) await CLI.fs.unlink(f);
     }
     progress(0.78, "Indexing BAM…");
@@ -1384,42 +1387,25 @@ const MAX_WINDOW_READS = 20000;
 // chunk's SAM text stays well under browser string limits. Sized from the depth, not counted.
 const SCAN_CHUNK_BASES = 12e6;
 const SCAN_MIN_BP = 500;
-let scanFileN = 0;
 
 // One chunk of the variant scan: all reads of [start, end) (end shortened to the chunk budget),
 // parsed, filtered like the reads view (MAPQ, supplementary), counted and called here (pileup.js),
-// so only the variant rows go back to the tab. samtools writes the SAM to a file, read back in one
-// piece: much faster than its stdout, which reaches JS line by line.
-// `timing`: ms per stage and the SAM size, for the console.
+// so only the variant rows go back to the tab.
 async function scanChunk(contig, bam, m) {
-    const ms = () => performance.now();
     const start = Math.max(0, Math.floor(m.start));
     const span = Math.max(SCAN_MIN_BP, Math.round(SCAN_CHUNK_BASES / Math.max(1, parseFloat(contig.meandepth) || 1)));
     const end = Math.min(contig.length, Math.ceil(m.end), start + span);
-    const t0 = ms();
-    const out = `scan${++scanFileN}.sam`;
-    await CLI.exec("samtools", ["view", "-F", EXCLUDE_FLAGS, "-o", out, bam, regionOf(contig.name, start, end)]);
-    const t1 = ms();
-    let sam;
-    try { sam = new TextDecoder().decode(await CLI.fs.readFile(out)); }
-    finally { try { await CLI.fs.unlink(out); } catch {} }
-    const t2 = ms();
+    const sam = await samtoolsText(["view", "-F", EXCLUDE_FLAGS, bam, regionOf(contig.name, start, end)]);
     const { seq: ref, reason } = await readContigSeq(referenceFile, contig.name, contig.length);
     if (!ref) throw new Error(`no reference sequence (${reason})`);
     const reads = [];
-    let parsed = 0;
     for (const line of sam.split('\n')) {
         const r = parseSamRead(line, ref);
-        if (!r) continue;
-        parsed++;
-        if (r.mapq >= m.minMapq && (m.showSupp || !r.supplementary)) reads.push(r);
+        if (r && r.mapq >= m.minMapq && (m.showSupp || !r.supplementary)) reads.push(r);
     }
-    const t3 = ms();
     const rows = [];
     collectVariants(countBases(reads, ref, start, end), rows);
-    const t4 = ms();
-    return { start, end, rows, timing: { view: t1 - t0, read: t2 - t1, parse: t3 - t2, call: t4 - t3,
-        samMB: sam.length / 1e6, reads: parsed, rows: rows.length } };
+    return { start, end, rows };
 }
 
 const READ_REQUESTS = { 'reads-window': MAX_WINDOW_READS, 'reads-scan': Infinity };
