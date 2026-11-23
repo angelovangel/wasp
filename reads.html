@@ -179,8 +179,8 @@
             <label class="group" id="pairs-box" hidden data-tip="Show the two mates of a read pair in one row, joined by a line.
 Grouping by strand then uses the strand of the first mate (R1)."><input type="checkbox" id="show-pairs" checked> pairs</label>
             <label class="group" data-tip="Show soft-clipped read ends"><input type="checkbox" id="show-clips" checked> clips</label>
-            <label class="group" data-tip="Hide insertions and deletions of up to this many bases in the reads (0: show all), like IGV.
-Only the drawing changes: depth, colours and variants still count them.">hide indels ≤ <input type="number" id="hide-indels" value="0" min="0" step="1" style="width: 3.5em" aria-label="Hide indels up to this many bases"> bp</label>
+            <label class="group" data-tip="Hide insertions and deletions of up to this many bases in the reads (0: show all, at most 20).
+Only the drawing changes: depth, colours and variants still count them.">hide indels ≤ <input type="number" id="hide-indels" value="0" min="0" max="20" step="1" style="width: 3.5em" aria-label="Hide indels up to this many bases"> bp</label>
             <label class="group" data-tip="Include supplementary alignments (other parts of split reads).
 Unticked, they are hidden and left out of depth and variants."><input type="checkbox" id="show-supp" checked> suppl.</label>
             <button id="dl-png" data-tip="Save the current view (depth, reference, feature tracks and reads) as a PNG image">PNG</button>
@@ -301,7 +301,8 @@ Each file is a track under the reference; loaded files are remembered for other 
     let winReq = 0, winLoading = false, winTimer = null, winError = '';
     let readSet = null;       // which reads `filtered` was built from (data.reads or win.reads)
     let showClips = true;
-    let hideIndelBp = 0;      // indels up to this length are not drawn (IGV's "hide small indels")
+    const MAX_HIDE_INDEL_BP = 20;
+    let hideIndelBp = 0;      // indels up to this length (at most MAX_HIDE_INDEL_BP) are not drawn (IGV's "hide small indels")
     let showPairs = true;     // mates of a read pair share a row, joined by a line
     let hasPairs = false;     // the reads are paired-end
     let showSupp = true;      // include supplementary alignments (pile, depth and variants)
@@ -1518,7 +1519,8 @@ Each file is a track under the reference; loaded files are remembered for other 
     $('show-clips').addEventListener('change', e => { showClips = e.target.checked; if (data) render(); });
     $('hide-indels').addEventListener('input', e => {
         const v = Math.floor(parseFloat(e.target.value));
-        hideIndelBp = v > 0 ? v : 0;
+        hideIndelBp = v > 0 ? Math.min(MAX_HIDE_INDEL_BP, v) : 0;
+        if (v > MAX_HIDE_INDEL_BP) e.target.value = MAX_HIDE_INDEL_BP;
         if (data) render();
     });
     $('show-supp').addEventListener('change', e => { showSupp = e.target.checked; if (data) applyMapqFilter(); });
